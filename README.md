@@ -119,7 +119,7 @@ project author's direction and integrated as local PCM WAV assets. See
 
 ## Build configuration
 
-- Android Gradle Plugin: 8.9.1
+- Android Gradle Plugin: 8.13.2
 - compileSdk: 36
 - targetSdk: 36
 - minSdk: 32
