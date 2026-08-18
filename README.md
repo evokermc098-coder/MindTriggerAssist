@@ -157,7 +157,7 @@ corresponding-source obligations for that build and preserve required notices.
 
 - Developer: **@EvokerUniverse**
 - Maintainer: **@EvokerUniverse**
-- AI coding assistance: **Chat GPT**
+- AI coding assistance: **Chat GPT / Codex**
 - CTS upstream reference: **MiCTS / parallelcc**
 - Audio generation provenance: **Claude Code**, at the project author's direction
 
