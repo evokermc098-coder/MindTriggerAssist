@@ -1,6 +1,6 @@
 # Third-party notices
 
-This file records direct libraries/assets intentionally used by the v16 source.
+This file records direct and transitive libraries/assets used by the v16.2 source.
 It is not a substitute for the license text files bundled with the project.
 
 ## MiCTS
@@ -60,7 +60,19 @@ used by this source is Shizuku-API, whose repository declares the MIT License.
 License text:
 `THIRD_PARTY_LICENSES/AndroidHiddenApiBypass_Apache-2.0.txt`
 
-## Bundled audio
+## Release dependency notices
+
+The 61 artifacts in [RELEASE_DEPENDENCY_INVENTORY.md](RELEASE_DEPENDENCY_INVENTORY.md)
+were checked against their cached Maven POMs and published AAR/JAR notices.
+Shizuku aidl/shared are MIT, like API/provider. AndroidX, Kotlin/coroutines,
+JetBrains annotations, Error Prone, Guava ListenableFuture and JSpecify declare
+Apache-2.0. Guava inherits its license from guava-parent:26.0-android.
+
+Full extracted notices and the artifact list are preserved in
+[Release_Dependency_Notices.txt](THIRD_PARTY_LICENSES/Release_Dependency_Notices.txt)
+and in the app's Apache license entry. Existing MIT and GPL entries are retained.
+
+## Bundled audio provenance
 
 `aura_cts.wav` and `aura_gemini.wav` are project audio assets. Their known
 provenance and SHA-256 hashes are documented in `AUDIO_PROVENANCE.md`; they are

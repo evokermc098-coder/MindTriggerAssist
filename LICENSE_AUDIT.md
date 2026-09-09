@@ -1,6 +1,6 @@
 # MindTrigger Assist v16 — license/compliance audit
 
-Audit date: 2026-08-18
+Direct-source recheck: 2026-09-09 (v16.2).
 
 This is a project compliance review, not legal advice.
 
@@ -16,7 +16,7 @@ upstream-derived MiCTS path and MiCTS is distributed under GNU GPL version 3.
 ### MindTrigger Assist
 
 - Declared project license: `GPL-3.0-only`.
-- All 16 Java source files in the app package carry
+- All 21 Java source files in the app package carry
   `SPDX-License-Identifier: GPL-3.0-only`.
 - Full GPLv3 license text is present in `LICENSE` and bundled for in-app viewing.
 
@@ -110,7 +110,19 @@ This audit covers:
 - direct Gradle dependencies declared by `app/build.gradle`;
 - upstream licenses checked above.
 
-A full built-APK transitive dependency/SBOM audit was not possible in this
-packaging environment because it does not contain the Android SDK/Gradle build
-toolchain. Before a store-scale distribution, a built artifact dependency report
-is still advisable.
+The 61 artifacts identified by the existing release lint model were checked
+against cached Maven POMs and AAR/JAR license and notice entries, recursively
+including nested JARs. Guava inherits Apache-2.0 from guava-parent:26.0-android;
+all other coordinates declare Apache-2.0 or MIT directly. Extracted notices are
+preserved verbatim (identical copies deduplicated) in the source and in-app
+Apache license resource. See [RELEASE_DEPENDENCY_INVENTORY.md](RELEASE_DEPENDENCY_INVENTORY.md)
+and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+No unresolved license declaration remains in this recorded dependency set.
+This is not a guarantee of originality of audio/screenshots or a legal opinion.
+Upstream license changes or a dependency update require a fresh inventory.
+
+The 2026-09-09 recheck confirmed 21 Java SPDX headers and existing GPL,
+Apache-2.0 and Shizuku MIT texts, including in-app raw resources. README credits
+were restored from historical commit 9370187. English and Vietnamese now have
+matching guide sections and credits in README.md and README.vi.md.

@@ -1,4 +1,3 @@
-
 Third-party dependency notices — MindTrigger Assist v16.2
 
 AndroidX: Android Open Source Project contributors — Apache-2.0
