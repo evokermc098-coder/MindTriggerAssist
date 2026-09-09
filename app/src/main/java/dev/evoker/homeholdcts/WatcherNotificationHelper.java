@@ -20,15 +20,21 @@ final class WatcherNotificationHelper {
     static Notification buildWatcherNotification(
             Context context,
             int logSessionState) {
+        boolean needsLogRecovery =
+                logSessionState == WatcherIpc.STATE_CONNECTING
+                        || logSessionState == WatcherIpc.STATE_NEEDS_RECONNECT;
 
         Intent open =
                 new Intent(
                         context,
-                        MainActivity.class);
+                        needsLogRecovery
+                                ? LogSessionBridgeActivity.class
+                                : MainActivity.class);
 
         open.addFlags(
                 Intent.FLAG_ACTIVITY_SINGLE_TOP
-                        | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                        | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                        | Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS);
 
         int piFlags = PendingIntent.FLAG_UPDATE_CURRENT;
 
@@ -41,6 +47,17 @@ final class WatcherNotificationHelper {
                         context,
                         1,
                         open,
+                        piFlags);
+
+        PendingIntent restoreIntent =
+                PendingIntent.getActivity(
+                        context,
+                        2,
+                        new Intent(context, LogSessionBridgeActivity.class)
+                                .addFlags(
+                                        Intent.FLAG_ACTIVITY_SINGLE_TOP
+                                                | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                                                | Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS),
                         piFlags);
 
         Notification.Builder b;
@@ -72,7 +89,7 @@ final class WatcherNotificationHelper {
 
         } else {
             text =
-                    "Open MindTrigger Assist to restore privileged logcat access";
+                    "Tap to restore privileged log access";
         }
 
         b.setSmallIcon(R.drawable.ic_stat_watch)
@@ -82,6 +99,15 @@ final class WatcherNotificationHelper {
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
                 .setCategory(Notification.CATEGORY_SERVICE);
+
+        if (needsLogRecovery) {
+            b.addAction(
+                    new Notification.Action.Builder(
+                            R.drawable.ic_stat_watch,
+                            UiText.tr(context, "Restore log access"),
+                            restoreIntent)
+                            .build());
+        }
 
         return b.build();
     }

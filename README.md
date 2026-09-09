@@ -1,174 +1,109 @@
-# MindTrigger Assist — v16.0.0 RC1
+# MindTrigger Assist v16.2
 
-MindTrigger Assist is an open-source ColorOS compatibility utility that maps a
-configured long-press Home/gesture signal to Circle to Search and can route a
-Power long press to the active Android Assistant voice session.
+Biến thao tác nhấn giữ của ColorOS thành Circle to Search hoặc gọi Trợ lý
+Android. Bản này dành chủ yếu cho OPPO Find X7 / ColorOS 16 China.
 
-Package: `dev.evoker.homeholdcts`
-Project repository: https://github.com/evokermc098-coder/MindTriggerAssist
+## 🎬 Setup nhanh nhất — xem video bên dưới
 
-## Runtime architecture
+Video hướng dẫn chính thức sẽ được gắn tại đây. Hiện chưa có link/video nguồn
+để nhúng; trong lúc chờ, cứ làm đúng sáu bước ngắn bên dưới.
 
-```text
-ColorOS long-press signal
-    ↓
-SpeechAssist service-start failure observed in selected logcat tags
-    ↓
-dev.evoker.homeholdcts:watcher
-    ├─ HomeHoldService foreground service
-    ├─ trigger classifier / debounce
-    └─ child logcat reader
-          ↓
-ActivationRunner
-    ├─ Home/gesture → CtsProtocol → CTS-specific voice-interaction bundle
-    └─ Power        → CtsProtocol → active Assistant voice session
-```
+## Cần chuẩn bị
 
-`CtsProtocol` obtains Android's `voiceinteraction` binder service and calls the
-hidden `IVoiceInteractionManagerService.showSessionFromSession(...)` interface.
-The CTS branch adds the CTS-specific invocation arguments; the Assistant branch
-does not.
+- MindTrigger Assist v16.2;
+- ứng dụng Shizuku đã cài và đang chạy;
+- Google hoặc Gemini đã cài nếu muốn gọi Assistant;
+- máy đã bật Wireless debugging hoặc kết nối PC để khởi động Shizuku.
 
-## Device-log session recovery
+Không cần root. Shizuku chỉ cần ở lúc setup; sau đó MindTrigger chạy độc lập.
 
-`READ_LOGS` and the privileged logcat access session are intentionally modeled as
-separate states:
+## Cài trong 3 phút
 
-- `READ_LOGS` is a package-level permission and remains granted across reboot.
-- privileged logcat access is session-scoped;
-- Android may require its own device-log access confirmation for a new session;
-- MindTrigger Assist does not bypass that confirmation.
+1. Mở **Shizuku** và khởi động nó bằng Wireless debugging hoặc PC.
+2. Mở **MindTrigger Assist**. Đồng ý điều khoản rồi bấm **Run setup with
+   Shizuku** ở trang đầu.
+3. Khi Shizuku hỏi quyền, bấm **Allow**. Chờ bảng kết quả hiện `SUCCESS`.
+4. Làm các mục ColorOS mà wizard hiển thị:
+   - bật **Touch and hold gesture guide bar to wake Breeno**;
+   - khóa MindTrigger Assist trong **Recent tasks**;
+   - bật **Auto launch** cho Google/Gemini.
+5. Bấm **Run MindTrigger Assist**. Khi Android hiện hộp thoại quyền đọc log,
+   hãy bấm **Allow**.
+6. Test:
+   - nhấn giữ Home/cử chỉ → Circle to Search;
+   - nhấn giữ Power → Assistant.
 
-The long-lived watcher runs in the private `:watcher` process. If an ACTIVE
-logcat session is lost, `LogSessionBridgeActivity` can briefly place the app UID
-in a foreground state so Android can display its own confirmation over the app
-currently in use. The bridge is transparent, excluded from Recents, and removed
-after recovery/timeout.
+Xong. Notification của MindTrigger phải còn hiển thị khi runtime đang chạy.
 
-After reboot, if the Android confirmation does not appear automatically, open
-MindTrigger Assist once.
+## Nếu bạn không dùng Shizuku
 
-## Setup
+Trong bước 1, bấm **Copy ADB one-shot**. Kết nối điện thoại với máy tính, chạy
+lệnh mà app vừa copy, rồi quay lại MindTrigger Assist và tiếp tục các bước
+ColorOS. Không cần giữ ADB hoặc Shizuku chạy sau khi setup xong.
 
-### Privileged setup
+## Những mục ColorOS bắt buộc
 
-Shizuku or the generated PC one-shot command is used to:
+ColorOS không cho app đọc đáng tin cậy các lựa chọn OEM này, nên bạn phải tự
+bật rồi xác nhận trong wizard:
 
-- grant `android.permission.READ_LOGS`;
-- configure the Google voice-interaction service as the Android default assistant;
-- apply the listed Doze / standby / AppOps background settings;
-- on the Shizuku first-run path only, run `pm uninstall --user 0` for
-  `com.heytap.speechassist` and `com.coloros.colordirectservice`.
+| Mục | Vì sao cần |
+| --- | --- |
+| Gesture Breeno | Đây là tín hiệu nhấn giữ mà MindTrigger dùng. |
+| Lock trong Recent tasks | **Clear all** sẽ không quét watcher của MindTrigger. |
+| Auto launch Google/Gemini | Assistant đỡ bị chết nền sau một thời gian. |
+| Hiển thị trên ứng dụng khác | Giúp watcher giữ được recovery path của ColorOS. |
 
-The latter commands remove those packages from user 0; they do not erase the
-system-partition APKs.
+Ở ColorOS 16.0.7, đọc cảnh báo đỏ ở cuối tab **Thiết lập**. Nếu bạn đã tự tắt
+giám sát quyền / System Optimization theo hướng dẫn của mình thì có thể bỏ qua
+cảnh báo đó.
 
-Normal Circle to Search activation does not require Shizuku to remain connected
-after privileged setup.
+## Khi đang chạy mà không còn nhận Home / Power
 
-### ColorOS manual requirements
+1. Mở MindTrigger Assist một lần.
+2. Nếu Android hiện hộp thoại quyền đọc log, bấm **Allow**.
+3. Vào tab **Thiết lập** và kiểm tra trạng thái *phiên đọc log*, không chỉ nhìn
+   dòng `READ_LOGS`.
+4. Nếu đã bật tile **Quick Settings log recovery** trong tab Beta, bạn cũng có
+   thể bấm tile đó từ bảng Cài đặt nhanh để yêu cầu phục hồi phiên log.
 
-MindTrigger Assist cannot reliably query several OEM-only ColorOS states. The UI
-therefore requires explicit confirmation for:
+`READ_LOGS` được cấp vẫn chưa chắc phiên đọc log còn sống. Notification foreground
+cũng chưa đủ để chứng minh reader còn hoạt động; trạng thái phiên log mới là thứ
+quan trọng.
 
-- the ColorOS long-press gesture entry point;
-- locking MindTrigger Assist in Recent Tasks;
-- Google/Gemini Auto launch.
+## Lưu ý quan trọng trước khi bấm setup
 
-The app does not claim to detect these states when no reliable public interface
-is available.
+Lần setup Shizuku đầu tiên có thể gỡ `com.heytap.speechassist` và
+`com.coloros.colordirectservice` khỏi user 0 để nhường đường cho trigger. APK hệ
+thống gốc không bị xóa khỏi phân vùng system, nhưng đây vẫn là thay đổi thiết bị
+thật. Đọc bảng lệnh/kết quả trong app và chỉ tiếp tục khi bạn đồng ý.
 
-## Release languages
+MindTrigger không có Device Admin, Accessibility service, child-process logcat,
+runtime Shizuku, hoặc permanent WakeLock.
 
-The v16 release selector contains only fully maintained locale packs:
+## Beta
 
-- `vi-VN` — Tiếng Việt
-- `en-US` — English
-- `id-ID` — Bahasa Indonesia
-- `th-TH` — ไทย
+Tab **Beta** có animation, voice wake, âm báo CTS/Assistant tối đa 3 giây, đổi
+mapping CTS ↔ Google Assistant và tile khôi phục log. Những mục này là tùy chọn;
+setup cơ bản không cần bật.
 
-All supported non-English packs contain the complete canonical UI string set.
-Technical identifiers, package names, Android API names, and license identifiers
-remain untranslated where translating them would make troubleshooting less
-precise. Unsupported device locales fall back to English.
-
-
-## Appearance
-
-Material 3 appearance modes:
-
-- White
-- System
-- Dark
-- Night
-
-Theme/color changes recreate the Activity while preserving the currently selected
-bottom-navigation tab. Selecting a theme from About therefore remains on About
-instead of returning to Setup.
-
-## Audio assets
-
-Bundled activation sounds:
-
-- `app/src/main/res/raw/aura_cts.wav`
-- `app/src/main/res/raw/aura_gemini.wav`
-
-Known project provenance records them as generated with Claude Code at the
-project author's direction and integrated as local PCM WAV assets. See
-`AUDIO_PROVENANCE.md` for format, hashes, and the conservative rights statement.
-
-## Build configuration
-
-- Android Gradle Plugin: 8.13.2
-- compileSdk: 36
-- targetSdk: 36
-- minSdk: 32
-- Java: 17
-- Material Components: 1.14.0
-- Shizuku API/provider: 13.1.5
-- AndroidHiddenApiBypass: 6.1
-- APK signing policy: v1 + v2 + v3 enabled, v4 disabled
-
-Release builds require a real keystore via `keystore.properties` or the documented
-environment variables. See `SIGNING.md`.
-
-## License
-
-MindTrigger Assist is distributed under **GNU GPL-3.0-only**.
-
-The Circle to Search invocation path was implemented with reference to the public
-MiCTS project and is treated as an upstream-derived GPL path for release and
-attribution purposes. Direct permissive dependencies retain their own notices.
-
-See:
-
-- `LICENSE` — complete GPLv3 text
-- `NOTICE.md` — upstream/modification notice
-- `SOURCE_PROVENANCE.md` — implementation provenance
-- `THIRD_PARTY_NOTICES.md` — direct third-party components
-- `LICENSE_AUDIT.md` — release compliance audit
-- `AUDIO_PROVENANCE.md` — bundled sound provenance
-- `TERMS_AND_PRIVACY.md` — privacy / redistribution notice
-
-If an APK or other object-code build is distributed, satisfy the applicable GPL
-corresponding-source obligations for that build and preserve required notices.
-
-## Credits
-
-- Developer: **@EvokerUniverse**
-- Maintainer: **@EvokerUniverse**
-- AI coding assistance: **Chat GPT / Codex**
-- CTS upstream reference: **MiCTS / parallelcc**
-- Audio generation provenance: **Claude Code**, at the project author's direction
-
-## Release validation
-
-Run:
+## Dành cho người build source
 
 ```sh
-python tools/release_sanity.py
+./gradlew assembleRelease
 ```
 
-The v16 check validates package/version metadata, locale completeness, stale
-release wording, required license/notice files, audio hashes, and critical
-runtime-file invariants that should not change during release polishing.
+- package: `dev.evoker.homeholdcts`
+- minSdk: 32
+- targetSdk / compileSdk: 36
+- Java: 17
+- APK release: ký bằng APK Signature Scheme v3
+
+Release cần keystore thật qua `keystore.properties`. Xem [SIGNING.md](SIGNING.md).
+
+## License và nguồn
+
+MindTrigger Assist phát hành theo **GPL-3.0-only**. Xem [LICENSE](LICENSE),
+[NOTICE.md](NOTICE.md), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) và
+[SOURCE_PROVENANCE.md](SOURCE_PROVENANCE.md).
+
+Repository: <https://github.com/evokermc098-coder/MindTriggerAssist>

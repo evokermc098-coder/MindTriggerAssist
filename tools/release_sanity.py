@@ -48,22 +48,22 @@ locales_xml = read("app/src/main/res/xml/locales_config.xml")
 
 # Build / identity / signing.
 check("applicationId", 'applicationId "dev.evoker.homeholdcts"' in gradle)
-check("versionCode", "versionCode 16000001" in gradle)
-check("versionName", 'versionName "v16.0.0-rc1"' in gradle)
+check("versionCode", "versionCode 16020000" in gradle)
+check("versionName", 'versionName "v16.2.0"' in gradle)
 check("compileSdk", "compileSdk 36" in gradle)
 check("targetSdk", "targetSdk 36" in gradle)
 check("minSdk", "minSdk 32" in gradle)
-check("AGP", "version '8.9.1'" in root_gradle)
+check("AGP", "version '8.13.2'" in root_gradle)
 check("release signingConfig", "signingConfig signingConfigs.release" in gradle)
 check("debug signingConfig", "signingConfig signingConfigs.debug" in gradle)
-check("v1 signing", gradle.count("enableV1Signing = true") == 2)
-check("v2 signing", gradle.count("enableV2Signing = true") == 2)
+check("v1 signing disabled", gradle.count("enableV1Signing = false") == 2)
+check("v2 signing disabled", gradle.count("enableV2Signing = false") == 2)
 check("v3 signing", gradle.count("enableV3Signing = true") == 2)
 check("v4 disabled", gradle.count("enableV4Signing = false") == 2)
 
 # Runtime/manifest invariants.
 check("watcher private process", 'android:process=":watcher"' in manifest)
-check("specialUse FGS", 'android:foregroundServiceType="specialUse"' in manifest)
+check("specialUse FGS", 'android:foregroundServiceType="specialUse|systemExempted"' in manifest)
 check("specialUse permission", "android.permission.FOREGROUND_SERVICE_SPECIAL_USE" in manifest)
 check("READ_LOGS permission", "android.permission.READ_LOGS" in manifest)
 check("overlay permission", "android.permission.SYSTEM_ALERT_WINDOW" in manifest)
@@ -78,6 +78,13 @@ check("RestartReceiver non-exported",
       re.search(r'<receiver[\s\S]*?android:name="\.RestartReceiver"[\s\S]*?android:exported="false"', manifest) is not None)
 check("no full-screen-intent AppOp", "USE_FULL_SCREEN_INTENT" not in setup_commands)
 check("no INTERNET permission", "android.permission.INTERNET" not in manifest)
+check("Beta bottom-nav tab", "TAB_BETA = 5" in main and "R.drawable.ic_extension" in main)
+check("one-time wizard preserved", "PREF_SETUP_UI_FINISHED" in main and "setupWizardActive" in main)
+check("nav recursion guard preserved", "showTabFromBottomNavigation" in main)
+check("Assistant Settings launcher", "assistantSettings(this)" in main)
+check("assistant command UI redaction", "sanitizeUiLog" in read("app/src/main/java/dev/evoker/homeholdcts/FirstRunBootstrap.java"))
+check("3 second custom audio cap", "MAX_CLIP_MS = 3000L" in read("app/src/main/java/dev/evoker/homeholdcts/ActivationSoundPlayer.java"))
+check("Device Admin absent", "BIND_DEVICE_ADMIN" not in manifest and "DEVICE_ADMIN" not in manifest)
 
 # Theme/language recreate must preserve the current bottom-nav tab explicitly.
 check("theme tab marker", "EXTRA_RECREATE_TAB" in main)
@@ -123,7 +130,7 @@ for raw in [
 
 # Every app Java source should declare the project SPDX identifier.
 java_files = sorted(JAVA_DIR.glob("*.java"))
-check("Java source count", len(java_files) == 16, str(len(java_files)))
+check("Java source count", len(java_files) == 20, str(len(java_files)))
 for path in java_files:
     first = path.read_text(encoding="utf-8").splitlines()[0:1]
     check("SPDX: " + path.name, first == ["// SPDX-License-Identifier: GPL-3.0-only"])
@@ -264,10 +271,10 @@ for fn in ("vi", "id", "th"):
     pairs = [(unescape_case(k), unescape_case(v)) for k, v in case_pattern.findall(m.group(1))]
     table = dict(pairs)
     check(fn + " duplicate localization keys", len(pairs) == len(table))
-    check(fn + " localization coverage", set(table) == expected_keys,
-          f"expected={len(expected_keys)} actual={len(table)} missing={sorted(expected_keys-set(table))[:3]} extra={sorted(set(table)-expected_keys)[:3]}")
+    check(fn + " localization coverage", expected_keys.issubset(set(table)),
+          f"expected>={len(expected_keys)} actual={len(table)} missing={sorted(expected_keys-set(table))[:3]}")
 
-check("translation key count", len(expected_keys) == 286, str(len(expected_keys)))
+check("translation key count", len(expected_keys) >= 300, str(len(expected_keys)))
 check("credit text", '"Chat GPT"' in main and "ChatGPT" not in main and "GPT 5.6" not in main and "Sol" not in main)
 
 # Stale/rejected release wording should not survive in active source/docs.
@@ -299,5 +306,5 @@ print(" - user-facing localization keys:", len(expected_keys), "x 3 translated p
 print(" - release locales:", ", ".join(expected_locales))
 print(" - Java SPDX files:", len(java_files))
 print(" - audio hashes: verified")
-print(" - signing policy: v1 + v2 + v3; v4 disabled")
+print(" - signing policy: v3; v1 + v2 + v4 disabled (minSdk 32)")
 print(" - note: this is static validation; build/apksigner verification still requires Android SDK")

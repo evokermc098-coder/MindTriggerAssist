@@ -6,8 +6,8 @@ Release configuration is intentionally separate from source control.
 
 APK builds are configured as:
 
-- v1 (JAR signing): enabled
-- v2 (APK Signature Scheme v2): enabled
+- v1 (JAR signing): disabled; minSdk is 32
+- v2 (APK Signature Scheme v2): disabled; minSdk is 32
 - v3 (APK Signature Scheme v3): enabled
 - v4: disabled
 

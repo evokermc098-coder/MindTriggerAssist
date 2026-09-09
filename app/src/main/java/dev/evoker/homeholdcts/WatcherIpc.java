@@ -23,6 +23,8 @@ final class WatcherIpc {
     static final String KEY_VIBRATE = "vibrate";
     static final String KEY_SOUND = "sound";
     static final String KEY_POWER_GEMINI = "power_gemini";
+    static final String KEY_VOICE_WAKE_ASSISTANT = "voice_wake_assistant";
+    static final String KEY_SWAP_CTS_ASSISTANT = "swap_cts_assistant";
 
     private WatcherIpc() {}
 }

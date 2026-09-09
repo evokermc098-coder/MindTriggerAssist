@@ -34,13 +34,20 @@ final class SetupCommands {
 
     static final class Command {
         final String label;
+        final String action;
         final String packageName;
         final String command;
         final boolean requiresInstalledPackage;
 
         Command(String label, String packageName, String command,
                 boolean requiresInstalledPackage) {
+            this(label, command, packageName, command, requiresInstalledPackage);
+        }
+
+        Command(String label, String action, String packageName, String command,
+                boolean requiresInstalledPackage) {
             this.label = label;
+            this.action = action;
             this.packageName = packageName;
             this.command = command;
             this.requiresInstalledPackage = requiresInstalledPackage;
@@ -61,40 +68,62 @@ final class SetupCommands {
         ArrayList<Command> out = new ArrayList<>();
         out.add(new Command(
                 "MindTrigger Assist",
+                "Grant READ_LOGS",
                 self,
                 "pm grant " + self + " android.permission.READ_LOGS",
                 true
         ));
 
         out.add(new Command(
-                "Google default assistant",
+                "Google",
+                "Set default assistant",
                 GOOGLE,
                 "settings --user 0 put secure assistant "
                         + GOOGLE_ASSISTANT_SERVICE,
                 true
         ));
         out.add(new Command(
-                "Google voice interaction service",
+                "Google",
+                "Set voice interaction service",
                 GOOGLE,
                 "settings --user 0 put secure voice_interaction_service "
                         + GOOGLE_ASSISTANT_SERVICE,
                 true
         ));
 
+        // These are the ColorOS/Android system switches discovered for the
+        // background-retention path. They are included in both one-shot setup
+        // routes; the existing package keep-alive commands remain below.
+        addInternal(out, self, "Disable phantom-process monitoring",
+                "settings put global settings_enable_monitor_phantom_procs false");
+        addInternal(out, self, "Disable cached-app freezer",
+                "settings put global cached_apps_freezer disabled");
+        addInternal(out, self, "Disable ColorOS app disable switch",
+                "settings --user 0 put secure app_disable_switch 0");
+        addInternal(out, self, "Disable ColorOS auto switch",
+                "settings --user 0 put secure auto_switch 0");
+        addInternal(out, self, "Disable ColorOS auto-freeze timer",
+                "settings --user 0 put secure auto_frozen_time 0");
+        addInternal(out, self, "Disable ColorOS auto power protection",
+                "settings put system auto_power_protect_state 0");
+
         for (Target target : targets(self)) {
             String p = target.packageName;
-            add(out, target.label, p, "dumpsys deviceidle whitelist +" + p);
-            add(out, target.label, p, "am set-inactive " + p + " false");
-            add(out, target.label, p, "am set-standby-bucket " + p + " active");
-            add(out, target.label, p,
+            add(out, target.label, "Add Doze whitelist", p,
+                    "dumpsys deviceidle whitelist +" + p);
+            add(out, target.label, "Mark app active", p,
+                    "am set-inactive " + p + " false");
+            add(out, target.label, "Set active standby bucket", p,
+                    "am set-standby-bucket " + p + " active");
+            add(out, target.label, "Allow background execution", p,
                     "cmd appops set " + p + " RUN_IN_BACKGROUND allow");
-            add(out, target.label, p,
+            add(out, target.label, "Allow unrestricted background execution", p,
                     "cmd appops set " + p + " RUN_ANY_IN_BACKGROUND allow");
-            add(out, target.label, p,
+            add(out, target.label, "Allow wake locks", p,
                     "cmd appops set " + p + " WAKE_LOCK allow");
-            add(out, target.label, p,
+            add(out, target.label, "Allow foreground service", p,
                     "cmd appops set " + p + " START_FOREGROUND allow");
-            add(out, target.label, p,
+            add(out, target.label, "Allow notifications", p,
                     "cmd appops set " + p + " POST_NOTIFICATION allow");
         }
         return out;
@@ -113,22 +142,49 @@ final class SetupCommands {
 
         out.add(new Command(
                 "Remove SpeechAssist from user 0",
+                "Remove competing ColorOS component",
                 SPEECH_ASSIST,
                 "pm uninstall --user 0 " + SPEECH_ASSIST,
                 true
         ));
         out.add(new Command(
                 "Remove ColorDirectService from user 0",
+                "Remove competing ColorOS component",
                 COLOR_DIRECT,
                 "pm uninstall --user 0 " + COLOR_DIRECT,
+                true
+        ));
+
+        // ColorOS keeps an OEM-owned package list in this secure setting. Do
+        // not replace it: retain the device's current text and append this
+        // package only when it is absent. This complex shell snippet stays in
+        // the Shizuku-only route, so the legacy PC one-shot remains simple.
+        out.add(new Command(
+                "MindTrigger Assist",
+                "Exclude from ColorOS app freeze list",
+                self,
+                "current=$(settings --user 0 get secure app_frozen_switch_close); "
+                        + "case \"$current\" in "
+                        + "null|'') next='" + self + "' ;; "
+                        + "*'" + self + "'*) next=\"$current\" ;; "
+                        + "*';'*) next=\"$current;" + self + "\" ;; "
+                        + "*'|'*) next=\"$current|" + self + "\" ;; "
+                        + "*) next=\"$current," + self + "\" ;; "
+                        + "esac; settings --user 0 put secure app_frozen_switch_close \"$next\"",
                 true
         ));
 
         return out;
     }
 
-    private static void add(List<Command> list, String label, String pkg, String cmd) {
-        list.add(new Command(label, pkg, cmd, true));
+    private static void add(
+            List<Command> list, String label, String action, String pkg, String cmd) {
+        list.add(new Command(label, action, pkg, cmd, true));
+    }
+
+    private static void addInternal(
+            List<Command> list, String self, String action, String cmd) {
+        list.add(new Command("ColorOS system", action, self, cmd, false));
     }
 
     static String speechAssistRestoreCommands() {

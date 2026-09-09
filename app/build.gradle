@@ -94,8 +94,8 @@ android {
         minSdk 32
         targetSdk 36
 
-        versionCode 16000002
-        versionName "v16.0.0-rc1"
+        versionCode 16020000
+        versionName "v16.2.0"
     }
 
     dependenciesInfo {
@@ -114,19 +114,19 @@ android {
 
     signingConfigs {
         /*
-         * Android's normal debug keystore is retained, but all three APK
-         * signature schemes are explicitly enabled.
+         * minSdk 32 devices support APK Signature Scheme v3.  Keeping the
+         * legacy v1/v2 blocks out avoids redundant signature payloads.
          */
         debug {
-            enableV1Signing = true
-            enableV2Signing = true
+            enableV1Signing = false
+            enableV2Signing = false
             enableV3Signing = true
             enableV4Signing = false
         }
 
         release {
-            enableV1Signing = true
-            enableV2Signing = true
+            enableV1Signing = false
+            enableV2Signing = false
             enableV3Signing = true
             enableV4Signing = false
 

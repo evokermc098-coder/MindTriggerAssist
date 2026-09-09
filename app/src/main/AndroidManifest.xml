@@ -5,6 +5,7 @@
     <uses-permission android:name="android.permission.READ_LOGS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
@@ -14,7 +15,10 @@
     <queries>
         <package android:name="com.google.android.googlequicksearchbox" />
         <package android:name="com.google.android.apps.bard" />
+        <package android:name="com.google.android.gsf" />
         <package android:name="com.google.android.gms" />
+        <package android:name="com.heytap.speechassist" />
+        <package android:name="com.coloros.colordirectservice" />
     </queries>
 
     <application
@@ -53,11 +57,29 @@
             android:process=":watcher"
             android:exported="false"
             android:stopWithTask="false"
-            android:foregroundServiceType="specialUse">
+            android:foregroundServiceType="specialUse|systemExempted">
 
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="persistent local device-log trigger watcher for user-enabled assistant shortcuts" />
+        </service>
+
+        <service
+            android:name=".WatcherRescueJobService"
+            android:permission="android.permission.BIND_JOB_SERVICE"
+            android:process=":rescue"
+            android:exported="false" />
+
+        <service
+            android:name=".LogSessionRecoveryTileService"
+            android:label="MindTrigger log recovery"
+            android:icon="@mipmap/ic_launcher"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
         </service>
 
         <provider
@@ -68,12 +90,14 @@
             android:exported="true"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
 
+
         <receiver
             android:name=".RestartReceiver"
             android:enabled="true"
             android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
                 <action android:name="dev.evoker.homeholdcts.RESTART" />
             </intent-filter>
         </receiver>

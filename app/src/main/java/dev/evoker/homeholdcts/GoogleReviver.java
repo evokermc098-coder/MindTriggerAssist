@@ -33,6 +33,20 @@ final class GoogleReviver {
     private GoogleReviver() {}
 
     static PrimeResult prime(Context context) {
+        PrimeLease lease = acquireWarmupLease(context);
+        try {
+            return lease.result;
+        } finally {
+            lease.close();
+        }
+    }
+
+    /**
+     * Holds one permitted Google provider connection for the short Assistant
+     * warm-up window. The caller must close it promptly; this is deliberately
+     * not a persistent keep-alive mechanism.
+     */
+    static PrimeLease acquireWarmupLease(Context context) {
         PackageManager pm = context.getPackageManager();
         int attempted = 0;
         int acquired = 0;
@@ -70,8 +84,12 @@ final class GoogleReviver {
                     acquired++;
                     Log.d(TAG, "Google primer acquired " + authority
                             + " process=" + info.processName);
-                    // One successful interactor/search process wake is enough.
-                    break;
+                    // One permitted provider is enough. Keep it only for the
+                    // caller's bounded warm-up window.
+                    PrimeLease lease = new PrimeLease(
+                            new PrimeResult(attempted, acquired), client);
+                    client = null;
+                    return lease;
                 }
             } catch (SecurityException ignored) {
                 // Provider exists but runtime policy denied access; skip it.
@@ -86,7 +104,7 @@ final class GoogleReviver {
             }
         }
 
-        return new PrimeResult(attempted, acquired);
+        return new PrimeLease(new PrimeResult(attempted, acquired), null);
     }
 
     static final class PrimeResult {
@@ -100,6 +118,27 @@ final class GoogleReviver {
 
         boolean wokeSomething() {
             return acquired > 0;
+        }
+    }
+
+    static final class PrimeLease implements AutoCloseable {
+        final PrimeResult result;
+        private ContentProviderClient client;
+
+        PrimeLease(PrimeResult result, ContentProviderClient client) {
+            this.result = result;
+            this.client = client;
+        }
+
+        @Override
+        public synchronized void close() {
+            if (client == null) return;
+            try {
+                client.close();
+            } catch (Throwable ignored) {
+            } finally {
+                client = null;
+            }
         }
     }
 }

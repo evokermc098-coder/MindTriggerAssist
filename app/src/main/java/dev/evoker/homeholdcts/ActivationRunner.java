@@ -41,6 +41,10 @@ final class ActivationRunner {
 
     private static final long RETRY_1_MS = 140L;
     private static final long RETRY_2_MS = 320L;
+    // Google Assistant can need a short process-start settle after it was
+    // reclaimed. CTS keeps its existing timing; this applies only to the
+    // generic Assistant session branch.
+    private static final long ASSISTANT_PRIME_SETTLE_MS = 240L;
 
     private final Context context;
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -49,6 +53,7 @@ final class ActivationRunner {
     private int attempt;
     private Target target;
     private boolean soundEnabled;
+    private GoogleReviver.PrimeLease assistantWarmupLease;
 
     ActivationRunner(Context context) {
         this.context = context.getApplicationContext();
@@ -88,18 +93,41 @@ final class ActivationRunner {
 
         Log.d(TAG, "Activation scheduled target=" + target
                 + " delay=" + delayMs + " ms");
+
+        if (target == Target.ASSISTANT_SESSION) {
+            // Start Google before the user-visible activation delay elapses.
+            // This is the same safe provider-based primer CTS already uses;
+            // it neither opens Google UI nor changes trigger classification.
+            handler.post(this::primeAssistantBeforeActivation);
+        }
         handler.postDelayed(this::primeAndRun, delayMs);
+    }
+
+    private void primeAssistantBeforeActivation() {
+        if (!active || target != Target.ASSISTANT_SESSION) return;
+        closeAssistantWarmupLease();
+        assistantWarmupLease = GoogleReviver.acquireWarmupLease(context);
+        GoogleReviver.PrimeResult prime = assistantWarmupLease.result;
+        Log.d(TAG, "Assistant pre-prime acquired=" + prime.acquired
+                + " attempted=" + prime.attempted);
     }
 
     private void primeAndRun() {
         if (!active || target == null) return;
 
-        GoogleReviver.PrimeResult prime = GoogleReviver.prime(context);
+        GoogleReviver.PrimeResult prime = target == Target.ASSISTANT_SESSION
+                && assistantWarmupLease != null
+                ? assistantWarmupLease.result
+                : GoogleReviver.prime(context);
         Log.d(TAG, "Activation primer target=" + target
                 + " acquired=" + prime.acquired
                 + " attempted=" + prime.attempted);
 
-        attemptTarget();
+        if (target == Target.ASSISTANT_SESSION) {
+            handler.postDelayed(this::attemptTarget, ASSISTANT_PRIME_SETTLE_MS);
+        } else {
+            attemptTarget();
+        }
     }
 
     private void attemptTarget() {
@@ -174,6 +202,7 @@ final class ActivationRunner {
 
     synchronized void shutdown() {
         handler.removeCallbacksAndMessages(null);
+        closeAssistantWarmupLease();
         active = false;
         attempt = 0;
         target = null;
@@ -181,9 +210,17 @@ final class ActivationRunner {
     }
 
     private synchronized void finish() {
+        closeAssistantWarmupLease();
         active = false;
         attempt = 0;
         target = null;
         soundEnabled = false;
+    }
+
+    private void closeAssistantWarmupLease() {
+        if (assistantWarmupLease != null) {
+            assistantWarmupLease.close();
+            assistantWarmupLease = null;
+        }
     }
 }

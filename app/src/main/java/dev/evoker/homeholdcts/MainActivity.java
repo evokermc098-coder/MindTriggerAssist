@@ -52,6 +52,7 @@ import com.google.android.material.radiobutton.MaterialRadioButton;
 import com.google.android.material.slider.Slider;
 
 import java.util.List;
+import java.util.ArrayList;
 import java.text.DateFormat;
 import java.util.Date;
 import java.util.Locale;
@@ -70,27 +71,68 @@ public class MainActivity extends Activity {
     static final String PREF_SOUND_ON_ACTIVATION = "sound_on_activation";
     static final String PREF_POWER_GEMINI_EXPERIMENTAL =
             "power_gemini_experimental";
+    static final String PREF_VOICE_WAKE_ASSISTANT_EXPERIMENTAL =
+            "voice_wake_assistant_experimental";
+    static final String PREF_SWAP_CTS_ASSISTANT_EXPERIMENTAL =
+            "swap_cts_assistant_experimental";
+    static final String PREF_BETA_SLOW_ANIMATIONS =
+            "beta_slow_animations";
+    static final String PREF_BETA_QUICK_SETTINGS_LOG_RECOVERY =
+            "beta_quick_settings_log_recovery";
 
     static final boolean DEFAULT_VIBRATE_ON_CTS = true;
     static final boolean DEFAULT_SOUND_ON_ACTIVATION = true;
     static final boolean DEFAULT_POWER_GEMINI_EXPERIMENTAL = true;
+    static final boolean DEFAULT_VOICE_WAKE_ASSISTANT_EXPERIMENTAL = false;
+    static final boolean DEFAULT_SWAP_CTS_ASSISTANT_EXPERIMENTAL = false;
+    static final boolean DEFAULT_BETA_SLOW_ANIMATIONS = false;
+    static final boolean DEFAULT_BETA_QUICK_SETTINGS_LOG_RECOVERY = false;
     static final int DEFAULT_CTS_DELAY_MS = 200;
     static final int MAX_CTS_DELAY_MS = 1000;
+
+    private static final int REQUEST_PICK_CTS_SOUND = 16101;
+    private static final int REQUEST_PICK_ASSISTANT_SOUND = 16102;
 
     private static final String PREF_GESTURE_CONFIRMED = "guide_gesture_confirmed";
     private static final String PREF_RECENTS_LOCKED = "guide_recents_locked";
     private static final String PREF_GOOGLE_AUTOSTART = "guide_google_autostart";
     private static final String PREF_GEMINI_AUTOSTART = "guide_gemini_autostart";
 
+    // UI-only wizard state. Runtime/core V5 behavior remains untouched.
+    private static final String PREF_SETUP_UI_PAGE = "stable_ui_setup_page";
+    private static final String PREF_SETUP_UI_FINISHED = "stable_ui_setup_finished";
+    private static final String STATE_SETUP_PAGE = "setup_page";
+    private static final String EXTRA_RECREATE_SETUP_PAGE =
+            "dev.evoker.homeholdcts.extra.RECREATE_SETUP_PAGE";
+
+    private static final int SETUP_PAGE_PRIVILEGED = 0;
+    private static final int SETUP_PAGE_GESTURE = 1;
+    private static final int SETUP_PAGE_BACKGROUND = 2;
+    private static final int SETUP_PAGE_GOOGLE = 3;
+    private static final int SETUP_PAGE_RUN = 4;
+    private static final int SETUP_PAGE_COUNT = 5;
+
     private static final int TAB_SETUP = 1;
     private static final int TAB_ADVANCED = 2;
     private static final int TAB_SUPPORT = 3;
     private static final int TAB_ABOUT = 4;
+    private static final int TAB_BETA = 5;
     private static final String STATE_SELECTED_TAB = "selected_tab";
     private static final String EXTRA_RECREATE_TAB =
             "dev.evoker.homeholdcts.extra.RECREATE_TAB";
 
+    // One visual grid for every tab.  These values deliberately live beside
+    // the UI-only constants: changing them must never affect setup or watcher
+    // behavior.
+    private static final int UI_PAGE_SIDE_DP = 20;
+    private static final int UI_PAGE_TOP_DP = 12;
+    private static final int UI_PAGE_BOTTOM_DP = 32;
+    private static final int UI_CARD_GAP_DP = 14;
+    private static final int UI_CARD_RADIUS_DP = 20;
+    private static final int UI_NESTED_CARD_RADIUS_DP = 16;
+
     private int currentTab = TAB_SETUP;
+    private int currentSetupPage = SETUP_PAGE_PRIVILEGED;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
 
@@ -98,6 +140,10 @@ public class MainActivity extends Activity {
 private Messenger watcherMessenger;
 private boolean watcherBound;
 private boolean activityResumed;
+private boolean activityHasWindowFocus;
+private boolean pendingTopLogReconnect;
+private boolean pendingTopLogReconnectForce;
+private boolean topLogReconnectScheduled;
 private int watcherSessionState =
         WatcherIpc.STATE_STOPPED;
 
@@ -140,10 +186,9 @@ private final ServiceConnection watcherConnection =
                         null,
                         false);
 
+
                 if (activityResumed) {
-                    ui.postDelayed(
-                            () -> requestLogSessionReconnect(false),
-                            220L);
+                    armLogSessionReconnectWhenTop(false);
                 }
             }
 
@@ -174,10 +219,31 @@ private final ServiceConnection watcherConnection =
     private int error;
 
     private FirstRunBootstrap bootstrap;
+    // Shizuku may invoke its sticky binder callback synchronously. Do not let
+    // a setup callback render into this activity until every view exists.
+    private boolean uiReady;
 
     private FrameLayout contentHost;
+    private BottomNavigationView bottomNav;
+    private boolean setupWizardActive;
+
+    private FrameLayout setupWizardHost;
+    private final ArrayList<View> setupWizardPages = new ArrayList<>();
+    private final ArrayList<View> setupProgressSegments = new ArrayList<>();
+    private ScrollView setupScroll;
+    private TextView setupWizardEyebrow;
+    private TextView setupWizardTitle;
+    private TextView setupWizardHint;
+    private MaterialButton setupBackButton;
+    private MaterialButton setupNextButton;
+    private TextView privilegedActionFeedback;
+    private TextView gestureActionFeedback;
+    private String lastBootstrapUiState = "";
+    private boolean buildingSetupWizard;
+
     private View setupPage;
     private View advancedPage;
+    private View betaPage;
     private View supportPage;
     private View aboutPage;
 
@@ -218,15 +284,18 @@ private final ServiceConnection watcherConnection =
     private TextView commandLogView;
     private TextView commandTimeView;
 
-    private final Shizuku.OnBinderReceivedListener binderListener = () -> {
-        if (bootstrap != null && termsAccepted()) bootstrap.beginIfNeeded();
-    };
+    private final Shizuku.OnBinderReceivedListener binderListener = () ->
+            runOnUiThread(() -> {
+                if (isUiReadyForUpdates() && bootstrap != null && termsAccepted()) {
+                    bootstrap.beginIfNeeded();
+                }
+            });
 
     private final Shizuku.OnRequestPermissionResultListener permissionListener =
             (requestCode, grantResult) -> {
                 if (bootstrap != null) {
                     bootstrap.onPermissionResult(requestCode, grantResult);
-                    runOnUiThread(this::refreshAll);
+                    runOnUiThread(this::refreshAllIfReady);
                 }
             };
 
@@ -241,8 +310,9 @@ private final ServiceConnection watcherConnection =
 
         int restoredTab = TAB_SETUP;
         Intent launchIntent = getIntent();
-        if (launchIntent != null
-                && launchIntent.hasExtra(EXTRA_RECREATE_TAB)) {
+        boolean restoredFromRecreateMarker = launchIntent != null
+                && launchIntent.hasExtra(EXTRA_RECREATE_TAB);
+        if (restoredFromRecreateMarker) {
             restoredTab = launchIntent.getIntExtra(
                     EXTRA_RECREATE_TAB,
                     TAB_SETUP);
@@ -251,20 +321,42 @@ private final ServiceConnection watcherConnection =
         } else if (state != null) {
             restoredTab = state.getInt(STATE_SELECTED_TAB, TAB_SETUP);
         }
-        if (restoredTab >= TAB_SETUP && restoredTab <= TAB_ABOUT) {
+        if (isKnownTab(restoredTab)) {
             currentTab = restoredTab;
         }
 
+        int restoredSetupPage = getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getInt(PREF_SETUP_UI_PAGE, SETUP_PAGE_PRIVILEGED);
+        if (launchIntent != null
+                && launchIntent.hasExtra(EXTRA_RECREATE_SETUP_PAGE)) {
+            restoredSetupPage = launchIntent.getIntExtra(
+                    EXTRA_RECREATE_SETUP_PAGE,
+                    restoredSetupPage);
+            launchIntent.removeExtra(EXTRA_RECREATE_SETUP_PAGE);
+        } else if (state != null) {
+            restoredSetupPage = state.getInt(
+                    STATE_SETUP_PAGE,
+                    restoredSetupPage);
+        }
+        currentSetupPage = Math.max(SETUP_PAGE_PRIVILEGED,
+                Math.min(SETUP_PAGE_RUN, restoredSetupPage));
+
+        // The onboarding wizard is a one-time surface. Once completed, the
+        // Setup tab becomes the normal compact/scrollable Setup & Health page
+        // and can never reopen the wizard automatically or from bottom nav.
+        setupWizardActive = !getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getBoolean(PREF_SETUP_UI_FINISHED, false);
+
         loadColors();
         configureWindow();
-
-        Shizuku.addBinderReceivedListenerSticky(binderListener);
-        Shizuku.addRequestPermissionResultListener(permissionListener);
 
         bootstrap = new FirstRunBootstrap(this, new FirstRunBootstrap.Callback() {
             @Override
             public void onState(String state) {
                 runOnUiThread(() -> {
+                    if (!isUiReadyForUpdates()) return;
+                    lastBootstrapUiState = state == null ? "" : state;
+                    updatePrivilegedActionFeedback(lastBootstrapUiState);
                     if (commandLogView != null) {
                         commandLogView.setText(bootstrap.getLastCommandLog());
                     }
@@ -276,6 +368,7 @@ private final ServiceConnection watcherConnection =
             @Override
             public void onLog(String log) {
                 runOnUiThread(() -> {
+                    if (!isUiReadyForUpdates()) return;
                     if (commandLogView != null) commandLogView.setText(log);
                     updateLastCommandTime();
                     refreshAll();
@@ -285,6 +378,12 @@ private final ServiceConnection watcherConnection =
 
         setContentView(buildRoot());
         showTab(currentTab);
+        uiReady = true;
+
+        // Register only after buildRoot(). This listener is sticky and can
+        // fire immediately when Shizuku is already running.
+        Shizuku.addBinderReceivedListenerSticky(binderListener);
+        Shizuku.addRequestPermissionResultListener(permissionListener);
         refreshAll();
 
         if (termsAccepted()) {
@@ -298,7 +397,69 @@ private final ServiceConnection watcherConnection =
     @Override
     protected void onSaveInstanceState(Bundle outState) {
         outState.putInt(STATE_SELECTED_TAB, currentTab);
+        outState.putInt(STATE_SETUP_PAGE, currentSetupPage);
         super.onSaveInstanceState(outState);
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+
+        if ((requestCode != REQUEST_PICK_CTS_SOUND
+                && requestCode != REQUEST_PICK_ASSISTANT_SOUND)
+                || resultCode != RESULT_OK
+                || data == null
+                || data.getData() == null) {
+            return;
+        }
+
+        final Uri uri = data.getData();
+        final boolean assistant = requestCode == REQUEST_PICK_ASSISTANT_SOUND;
+
+        try {
+            final int takeFlags = data.getFlags()
+                    & (Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            getContentResolver().takePersistableUriPermission(uri, takeFlags);
+        } catch (Throwable ignored) {
+            // The selected clip is imported into app-private storage below,
+            // so a persistable grant is only an optimization.
+        }
+
+        Toast.makeText(this, tr("Importing activation sound…"), Toast.LENGTH_SHORT).show();
+        final Context appContext = getApplicationContext();
+        new Thread(() -> {
+            ActivationSoundPlayer.ImportResult result =
+                    ActivationSoundPlayer.importCustomClip(appContext, uri, assistant);
+            runOnUiThread(() -> {
+                if (isFinishing() || (Build.VERSION.SDK_INT >= 17 && isDestroyed())) {
+                    return;
+                }
+                Toast.makeText(
+                        this,
+                        tr(result.success
+                                ? "Activation sound saved · max 3 seconds"
+                                : "Could not import activation sound"),
+                        result.success ? Toast.LENGTH_SHORT : Toast.LENGTH_LONG)
+                        .show();
+                if (result.success) {
+                    recreatePreservingTab();
+                }
+            });
+        }, "MindTrigger-AudioImport").start();
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (setupWizardActive && currentTab == TAB_SETUP) {
+            if (currentSetupPage > SETUP_PAGE_PRIVILEGED) {
+                setSetupWizardPage(currentSetupPage - 1, true);
+            } else {
+                super.onBackPressed();
+            }
+            return;
+        }
+        super.onBackPressed();
     }
 
 @Override
@@ -311,9 +472,7 @@ protected void onNewIntent(Intent intent) {
                     "homehold_auto_log_recovery",
                     false)) {
 
-        ui.postDelayed(
-                () -> requestLogSessionReconnect(true),
-                220L);
+        armLogSessionReconnectWhenTop(true);
     }
 }
 
@@ -341,9 +500,7 @@ protected void onResume() {
         startWatcher();
         bindWatcher();
 
-        ui.postDelayed(
-                () -> requestLogSessionReconnect(false),
-                220L);
+        armLogSessionReconnectWhenTop(false);
     }
 
     statusPollRemaining = 40;
@@ -354,8 +511,19 @@ protected void onResume() {
 @Override
 protected void onPause() {
     activityResumed = false;
+    activityHasWindowFocus = false;
     ui.removeCallbacks(pcDetectLoop);
     super.onPause();
+}
+
+@Override
+public void onWindowFocusChanged(boolean hasFocus) {
+    super.onWindowFocusChanged(hasFocus);
+    activityHasWindowFocus = hasFocus;
+
+    if (hasFocus && activityResumed) {
+        maybeRunTopLogReconnect();
+    }
 }
 
 @Override
@@ -366,6 +534,7 @@ protected void onStop() {
 
     @Override
     protected void onDestroy() {
+        uiReady = false;
         Shizuku.removeBinderReceivedListener(binderListener);
         Shizuku.removeRequestPermissionResultListener(permissionListener);
         super.onDestroy();
@@ -404,13 +573,15 @@ protected void onStop() {
 
         contentHost = new FrameLayout(this);
 
-        setupPage = buildSetupPage();
+        setupPage = setupWizardActive ? buildSetupPage() : buildMainSetupPage();
         advancedPage = buildAdvancedPage();
+        betaPage = buildBetaPage();
         supportPage = buildSupportPage();
         aboutPage = buildAboutPage();
 
         contentHost.addView(setupPage, matchFrame());
         contentHost.addView(advancedPage, matchFrame());
+        contentHost.addView(betaPage, matchFrame());
         contentHost.addView(supportPage, matchFrame());
         contentHost.addView(aboutPage, matchFrame());
 
@@ -419,34 +590,39 @@ protected void onStop() {
                 0,
                 1f));
 
-        BottomNavigationView nav = new BottomNavigationView(this);
-        nav.setBackgroundColor(surfaceContainer);
-        nav.setItemIconTintList(makeNavColorStateList());
-        nav.setItemTextColor(makeNavColorStateList());
-        nav.setLabelVisibilityMode(BottomNavigationView.LABEL_VISIBILITY_LABELED);
-        nav.setItemActiveIndicatorEnabled(true);
-        nav.setItemActiveIndicatorColor(
+        bottomNav = new BottomNavigationView(this);
+        bottomNav.setBackgroundColor(surfaceContainer);
+        bottomNav.setItemIconTintList(makeNavColorStateList());
+        bottomNav.setItemTextColor(makeNavColorStateList());
+        bottomNav.setLabelVisibilityMode(BottomNavigationView.LABEL_VISIBILITY_LABELED);
+        bottomNav.setItemActiveIndicatorEnabled(true);
+        bottomNav.setItemActiveIndicatorColor(
                 ColorStateList.valueOf(primaryContainer));
-        nav.setElevation(0f);
-        nav.setTranslationZ(0f);
+        bottomNav.setElevation(0f);
+        bottomNav.setTranslationZ(0f);
 
-        Menu menu = nav.getMenu();
+        Menu menu = bottomNav.getMenu();
         menu.add(Menu.NONE, TAB_SETUP, Menu.NONE, tr("Setup"))
                 .setIcon(R.drawable.ic_setup);
         menu.add(Menu.NONE, TAB_ADVANCED, Menu.NONE, tr("Advanced"))
                 .setIcon(R.drawable.ic_advanced);
+        menu.add(Menu.NONE, TAB_BETA, Menu.NONE, tr("Beta"))
+                .setIcon(R.drawable.ic_extension);
         menu.add(Menu.NONE, TAB_SUPPORT, Menu.NONE, tr("Support me"))
                 .setIcon(R.drawable.ic_support);
         menu.add(Menu.NONE, TAB_ABOUT, Menu.NONE, tr("About"))
                 .setIcon(R.drawable.ic_about);
 
-        nav.setOnItemSelectedListener(item -> {
-            showTab(item.getItemId());
+        bottomNav.setOnItemSelectedListener(item -> {
+            // NavigationBarView invokes this listener before its internal selected
+            // item state is guaranteed to be committed. Calling showTab() here
+            // would programmatically call setSelectedItemId() again and recurse.
+            showTabFromBottomNavigation(item.getItemId());
             return true;
         });
-        nav.setSelectedItemId(currentTab);
+        bottomNav.setSelectedItemId(currentTab);
 
-        root.addView(nav, new LinearLayout.LayoutParams(
+        root.addView(bottomNav, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
@@ -454,24 +630,382 @@ protected void onStop() {
     }
 
     private View buildSetupPage() {
+        LinearLayout screen = new LinearLayout(this);
+        screen.setOrientation(LinearLayout.VERTICAL);
+        screen.setBackgroundColor(surface);
+        screen.setPadding(dp(22), dp(10), dp(22), 0);
+
+        // Android/OOBE-style setup: no app bottom navigation and no Close button.
+        setupWizardEyebrow = sectionEyebrow("SETUP · PAGE 1 OF 5");
+        screen.addView(setupWizardEyebrow,
+                new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        setupWizardTitle = text("Shizuku setup", 25, onSurface, Typeface.BOLD);
+        setupWizardTitle.setLineSpacing(0, 1.01f);
+        screen.addView(setupWizardTitle, margins(0, 14, 0, 0));
+
+        setupWizardHint = supporting(
+                "Complete one stage at a time. MindTrigger remembers this page when Android or ColorOS Settings recreates the app.");
+        setupWizardHint.setTextSize(15);
+        screen.addView(setupWizardHint, margins(0, 6, 0, 0));
+
+        LinearLayout progress = new LinearLayout(this);
+        progress.setOrientation(LinearLayout.HORIZONTAL);
+        progress.setGravity(Gravity.CENTER_VERTICAL);
+        setupProgressSegments.clear();
+        for (int i = 0; i < SETUP_PAGE_COUNT; i++) {
+            View segment = new View(this);
+            setupProgressSegments.add(segment);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(4), 1f);
+            if (i > 0) lp.leftMargin = dp(6);
+            progress.addView(segment, lp);
+        }
+        screen.addView(progress, margins(0, 16, 0, 16));
+
+        setupScroll = pageScroll();
+        setupScroll.setFillViewport(true);
+        setupScroll.setBackgroundColor(Color.TRANSPARENT);
+
+        LinearLayout scrollRoot = column();
+        scrollRoot.setPadding(0, 0, 0, dp(14));
+        setupWizardHost = new FrameLayout(this);
+        setupWizardPages.clear();
+
+        addSetupWizardPage(page -> addStep1(page));
+        addSetupWizardPage(page -> addGestureRequirement(page));
+        addSetupWizardPage(page -> addStep2(page));
+        addSetupWizardPage(page -> addStep3(page));
+        addSetupWizardPage(page -> {
+            // StableUI R3: use the original V5 Run card and its untouched
+            // click handler. The wizard footer never starts runtime code.
+            addRunCard(page);
+        });
+
+        scrollRoot.addView(setupWizardHost,
+                new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT));
+        setupScroll.addView(scrollRoot,
+                new ScrollView.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT));
+        screen.addView(setupScroll,
+                new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        0,
+                        1f));
+
+        LinearLayout footer = new LinearLayout(this);
+        footer.setOrientation(LinearLayout.HORIZONTAL);
+        footer.setGravity(Gravity.CENTER_VERTICAL);
+        footer.setPadding(0, dp(10), 0, dp(14));
+
+        setupBackButton = textButton("Back");
+        setupBackButton.setOnClickListener(v ->
+                setSetupWizardPage(currentSetupPage - 1, true));
+        footer.addView(setupBackButton,
+                new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        footer.addView(new View(this),
+                new LinearLayout.LayoutParams(0, 1, 1f));
+
+        setupNextButton = filledButton("Continue");
+        setupNextButton.setMinWidth(dp(140));
+        setupNextButton.setOnClickListener(v -> {
+            if (currentSetupPage < SETUP_PAGE_RUN) {
+                if (!isCurrentSetupPageComplete()) {
+                    Toast.makeText(this,
+                            tr("Complete this step before continuing."),
+                            Toast.LENGTH_LONG).show();
+                    refreshAll();
+                    updateSetupWizardChrome();
+                    return;
+                }
+                setSetupWizardPage(currentSetupPage + 1, true);
+                return;
+            }
+
+            String missing = firstMissingRequiredStep();
+            if (missing != null) {
+                Toast.makeText(this, missing, Toast.LENGTH_LONG).show();
+                refreshAll();
+                updateSetupWizardChrome();
+                return;
+            }
+
+            // StableUI R3: footer is navigation only. Runtime is started
+            // exclusively by the original V5 Run button above. This prevents
+            // wizard/UI lifecycle from entering the watcher start path.
+            boolean watcherReady = isWatcherRunning()
+                    && watcherSessionState == WatcherIpc.STATE_ACTIVE;
+            if (!watcherReady) {
+                Toast.makeText(
+                        this,
+                        tr("Run MindTrigger Assist above and approve Android's device-log access first."),
+                        Toast.LENGTH_LONG).show();
+                refreshAll();
+                updateSetupWizardChrome();
+                return;
+            }
+
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+                    .edit()
+                    .putBoolean(PREF_SETUP_UI_FINISHED, true)
+                    .putInt(PREF_SETUP_UI_PAGE, SETUP_PAGE_RUN)
+                    .commit();
+
+            // Rebuild only the Activity UI. Runtime is already ACTIVE and the
+            // V5 watcher/service path is untouched. The rebuilt Setup tab is
+            // the permanent compact scroll page with bottom navigation.
+            setupWizardActive = false;
+            currentTab = TAB_SETUP;
+            recreatePreservingTab();
+        });
+        footer.addView(setupNextButton,
+                new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT));
+        screen.addView(footer,
+                new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        setSetupWizardPage(currentSetupPage, false);
+        return screen;
+    }
+
+    /**
+     * Permanent post-onboarding Setup tab. It deliberately reuses the same
+     * action builders/verifiers as the one-time wizard so state and behavior
+     * cannot drift between onboarding and the normal app UI.
+     */
+    private View buildMainSetupPage() {
         ScrollView scroll = pageScroll();
         LinearLayout root = pageRoot();
 
-        addTopBar(root, "MindTrigger Assist", "Setup");
-        addHero(root);
-        addCriticalRequirements(root);
+        addTopBar(root, "Setup", "Setup & health");
 
-        TextView setupLabel = sectionEyebrow("SETUP");
-        root.addView(setupLabel, margins(4, 10, 0, 10));
+        TextView intro = supporting(
+                "Manage setup and fix warnings here. The first-run guide will not return.");
+        root.addView(intro, margins(0, 0, 0, 14));
 
-        addGestureRequirement(root);
+        // Reuse the exact same sections/backends as onboarding. Because
+        // buildingSetupWizard is false, each section renders in its normal
+        // compact card form suitable for a scrollable app tab.
         addStep1(root);
+        addGestureRequirement(root);
         addStep2(root);
         addStep3(root);
         addRunCard(root);
+        root.addView(buildColorOsPermissionMonitoringWarning(),
+                margins(0, 0, 0, UI_CARD_GAP_DP));
 
-        scroll.addView(root);
+        scroll.addView(root, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
         return scroll;
+    }
+
+    private interface SetupPageBuilder {
+        void build(LinearLayout root);
+    }
+
+    private void addSetupWizardPage(SetupPageBuilder builder) {
+        LinearLayout page = column();
+        buildingSetupWizard = true;
+        try {
+            builder.build(page);
+        } finally {
+            buildingSetupWizard = false;
+        }
+        page.setVisibility(View.GONE);
+        setupWizardPages.add(page);
+        setupWizardHost.addView(page,
+                new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT));
+    }
+
+    private void setSetupWizardPage(int page, boolean scrollToTop) {
+        int clamped = Math.max(SETUP_PAGE_PRIVILEGED,
+                Math.min(SETUP_PAGE_RUN, page));
+        currentSetupPage = clamped;
+
+        // commit(), not apply(): ColorOS may kill this Activity immediately
+        // after we launch a Settings screen.
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .putInt(PREF_SETUP_UI_PAGE, currentSetupPage)
+                .commit();
+
+        updateSetupWizardChrome();
+        if (scrollToTop && setupScroll != null) {
+            setupScroll.post(() -> setupScroll.scrollTo(0, 0));
+        }
+    }
+
+    private void updateSetupWizardChrome() {
+        if (setupWizardPages.isEmpty()) return;
+
+        for (int i = 0; i < setupWizardPages.size(); i++) {
+            setupWizardPages.get(i).setVisibility(
+                    i == currentSetupPage ? View.VISIBLE : View.GONE);
+        }
+
+        String[] titles = {
+                "Shizuku setup",
+                "ColorOS gesture",
+                "Background access",
+                "Google & Gemini",
+                "Ready to run"
+        };
+        String[] hints = {
+                "Run the privileged bootstrap first. Shizuku is only needed for setup, not normal runtime.",
+                "Enable and verify the ColorOS long-press entry point used by MindTrigger Assist.",
+                "Configure overlay and retention settings used by the stable V5 watcher.",
+                "Verify Google and Gemini are actually unrestricted in Android battery settings.",
+                "Review the final state, start MindTrigger Assist, then approve Android device-log access."
+        };
+
+        if (setupWizardEyebrow != null) {
+            setupWizardEyebrow.setText(tr("SETUP · PAGE ")
+                    + (currentSetupPage + 1)
+                    + " / " + SETUP_PAGE_COUNT);
+        }
+        if (setupWizardTitle != null) {
+            setupWizardTitle.setText(tr(titles[currentSetupPage]));
+        }
+        if (setupWizardHint != null) {
+            setupWizardHint.setText(tr(hints[currentSetupPage]));
+        }
+
+        for (int i = 0; i < setupProgressSegments.size(); i++) {
+            int color = i <= currentSetupPage ? primary : surfaceContainerHigh;
+            setupProgressSegments.get(i).setBackground(roundRect(color, 6));
+        }
+
+        if (setupBackButton != null) {
+            boolean canBack = currentSetupPage > SETUP_PAGE_PRIVILEGED;
+            setupBackButton.setVisibility(canBack ? View.VISIBLE : View.INVISIBLE);
+            setupBackButton.setEnabled(canBack);
+        }
+
+        if (setupNextButton != null) {
+            boolean finalPage = currentSetupPage == SETUP_PAGE_RUN;
+            boolean complete = isCurrentSetupPageComplete();
+            boolean watcherReady = isWatcherRunning()
+                    && watcherSessionState == WatcherIpc.STATE_ACTIVE;
+            setupNextButton.setEnabled(finalPage ? watcherReady : complete);
+            setupNextButton.setAlpha(setupNextButton.isEnabled() ? 1f : 0.45f);
+            setupNextButton.setText(tr(finalPage ? "Finish" : "Continue"));
+        }
+    }
+
+    private boolean isCurrentSetupPageComplete() {
+        switch (currentSetupPage) {
+            case SETUP_PAGE_PRIVILEGED:
+                return isReadLogsGranted();
+            case SETUP_PAGE_GESTURE:
+                return pref(PREF_GESTURE_CONFIRMED);
+            case SETUP_PAGE_BACKGROUND:
+                return Settings.canDrawOverlays(this)
+                        && pref(PREF_RECENTS_LOCKED);
+            case SETUP_PAGE_GOOGLE:
+                boolean googleInstalled = packageExists(SetupCommands.GOOGLE);
+                boolean geminiInstalled = packageExists(SetupCommands.GEMINI);
+                boolean assistantOk = !googleInstalled || isGoogleAssistantSelected();
+                boolean googleBatteryOk = !googleInstalled
+                        || isIgnoringBattery(SetupCommands.GOOGLE);
+                boolean geminiBatteryOk = !geminiInstalled
+                        || isIgnoringBattery(SetupCommands.GEMINI);
+                boolean autoLaunchOk = (!googleInstalled && !geminiInstalled)
+                        || (pref(PREF_GOOGLE_AUTOSTART)
+                        && pref(PREF_GEMINI_AUTOSTART));
+                return assistantOk
+                        && googleBatteryOk
+                        && geminiBatteryOk
+                        && autoLaunchOk;
+            case SETUP_PAGE_RUN:
+            default:
+                return firstMissingRequiredStep() == null;
+        }
+    }
+
+    private void updatePrivilegedActionFeedback(String state) {
+        if (privilegedActionFeedback == null || state == null) return;
+        String message;
+        int color = onSurfaceVariant;
+        switch (state) {
+            case "RUNNING_SETUP":
+                message = "Running privileged setup…";
+                color = primary;
+                break;
+            case "REQUESTING_SHIZUKU":
+                message = "Waiting for Shizuku permission…";
+                color = primary;
+                break;
+            case "READY":
+                message = "✓ Privileged setup completed.";
+                color = success;
+                break;
+            case "READY_WITH_WARNINGS":
+                message = "⚠ Setup completed with warnings. Review the command log in Advanced.";
+                color = warning;
+                break;
+            case "SHIZUKU_NOT_RUNNING":
+                message = "Shizuku is not running. Start Shizuku, then try again.";
+                color = error;
+                break;
+            case "SHIZUKU_TOO_OLD":
+                message = "Shizuku is too old for this setup path.";
+                color = error;
+                break;
+            case "SHIZUKU_DENIED":
+                message = "Shizuku permission was denied.";
+                color = error;
+                break;
+            case "READ_LOGS_NOT_GRANTED":
+                message = "Setup ran, but READ_LOGS is still not granted.";
+                color = error;
+                break;
+            case "BOOTSTRAP_ERROR":
+            case "BOOTSTRAP_FAILED":
+                message = "Privileged setup failed. Review the command log in Advanced.";
+                color = error;
+                break;
+            default:
+                message = state.isEmpty() ? "Waiting for setup." : state;
+                break;
+        }
+        privilegedActionFeedback.setText(tr(message));
+        privilegedActionFeedback.setTextColor(color);
+        privilegedActionFeedback.setVisibility(View.VISIBLE);
+        updateSetupWizardChrome();
+    }
+
+    private void setGestureActionFeedback(String message, boolean ok) {
+        if (gestureActionFeedback == null) return;
+        gestureActionFeedback.setText(tr(message));
+        gestureActionFeedback.setTextColor(ok ? success : onSurfaceVariant);
+        gestureActionFeedback.setVisibility(View.VISIBLE);
+    }
+
+    private void attachSetupSection(
+            LinearLayout root,
+            MaterialCardView shell,
+            LinearLayout body,
+            int bottomMarginDp) {
+        if (buildingSetupWizard) {
+            body.setPadding(0, 0, 0, 0);
+            root.addView(body, margins(0, 0, 0, bottomMarginDp));
+        } else {
+            shell.addView(body);
+            root.addView(shell, margins(0, 0, 0, bottomMarginDp));
+        }
     }
 
     private View buildAdvancedPage() {
@@ -559,7 +1093,8 @@ protected void onStop() {
 
         TextView triggerDesc = supporting(
                 "The isolated watcher uses one activation pipeline and routes by trigger: " +
-                "Home/gesture → Circle to Search; Power → Assistant voice session.");
+                "Home/gesture → Circle to Search; Power → Assistant voice session. " +
+                "Experimental voice wake and action swapping live in the Beta tab.");
         triggersBody.addView(triggerDesc, margins(0, 4, 0, 12));
 
         MaterialSwitch powerGemini = new MaterialSwitch(this);
@@ -584,19 +1119,15 @@ protected void onStop() {
         triggersBody.addView(recoveryBuiltIn, margins(0, 10, 0, 10));
 
         TextView assistantTransportDesc = supporting(
-                "Both branches use the same delay and haptic settings, then call the Android " +
-                "VoiceInteractionManager binder interface. Power requests the active Assistant " +
-                "voice session; Home/gesture sends the CTS-specific invocation bundle.");
+                "Both stable routes use the same delay and haptic settings, then call the Android " +
+                "VoiceInteractionManager binder interface. Power requests the active Assistant voice session; " +
+                "Home/gesture sends the CTS-specific invocation bundle.");
         triggersBody.addView(assistantTransportDesc, margins(0, 6, 0, 10));
 
         TextView auraDesc = supporting(
                 "Activation feedback uses bundled local PCM audio cues after a successful " +
                 "request. No activation audio is downloaded or streamed.");
         triggersBody.addView(auraDesc, margins(0, 0, 0, 10));
-
-        TextView markerWindow = supporting(
-                "POWER classification window: 500 ms before SpeechAssist failure.");
-        triggersBody.addView(markerWindow, margins(0, 10, 0, 0));
 
         triggers.addView(triggersBody);
         root.addView(triggers, margins(0, 0, 0, 14));
@@ -678,11 +1209,183 @@ protected void onStop() {
     }
 
 
+    private View buildBetaPage() {
+        ScrollView scroll = pageScroll();
+        LinearLayout root = pageRoot();
+
+        addTopBar(root, "Beta", "Experimental features");
+
+        MaterialCardView intro = sectionCard();
+        LinearLayout introBody = sectionBody();
+        introBody.addView(text("V16.2", 20, onSurface, Typeface.BOLD));
+        introBody.addView(supporting(
+                "Try optional features without changing background protection."),
+                margins(0, 4, 0, 0));
+        intro.addView(introBody);
+        root.addView(intro, margins(0, 0, 0, 14));
+
+        MaterialCardView animation = sectionCard();
+        LinearLayout animationBody = sectionBody();
+        animationBody.addView(text("Slow-motion transitions", 20, onSurface, Typeface.BOLD));
+        animationBody.addView(supporting(
+                "Animate tab changes with fade, zoom and movement. This affects UI presentation only."),
+                margins(0, 4, 0, 10));
+
+        MaterialSwitch slowMotion = new MaterialSwitch(this);
+        slowMotion.setText(tr("Enable slow-motion animation"));
+        slowMotion.setTextColor(onSurface);
+        slowMotion.setChecked(getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getBoolean(PREF_BETA_SLOW_ANIMATIONS, DEFAULT_BETA_SLOW_ANIMATIONS));
+        slowMotion.setOnCheckedChangeListener((button, checked) ->
+                getSharedPreferences(PREFS, MODE_PRIVATE)
+                        .edit().putBoolean(PREF_BETA_SLOW_ANIMATIONS, checked).apply());
+        animationBody.addView(slowMotion);
+        animation.addView(animationBody);
+        root.addView(animation, margins(0, 0, 0, 14));
+
+        MaterialCardView voice = sectionCard();
+        LinearLayout voiceBody = sectionBody();
+        voiceBody.addView(text("Voice wake", 20, onSurface, Typeface.BOLD));
+        voiceBody.addView(supporting(
+                "Choose what happens after ColorOS detects voice wake."),
+                margins(0, 4, 0, 10));
+
+        MaterialSwitch voiceWake = new MaterialSwitch(this);
+        voiceWake.setText(tr("Wakeup with voice"));
+        voiceWake.setTextColor(onSurface);
+        voiceWake.setChecked(getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getBoolean(PREF_VOICE_WAKE_ASSISTANT_EXPERIMENTAL,
+                        DEFAULT_VOICE_WAKE_ASSISTANT_EXPERIMENTAL));
+        voiceWake.setOnCheckedChangeListener((button, checked) -> {
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+                    .edit().putBoolean(PREF_VOICE_WAKE_ASSISTANT_EXPERIMENTAL, checked).apply();
+            syncWatcherPrefs();
+        });
+        voiceBody.addView(voiceWake);
+        voice.addView(voiceBody);
+        root.addView(voice, margins(0, 0, 0, 14));
+
+        MaterialCardView quickRecovery = sectionCard();
+        LinearLayout quickRecoveryBody = sectionBody();
+        quickRecoveryBody.addView(text("Quick Settings log recovery", 20, onSurface, Typeface.BOLD));
+        quickRecoveryBody.addView(supporting(
+                "Add a tile to check the log session. It does nothing when the session is healthy."),
+                margins(0, 4, 0, 10));
+
+        MaterialSwitch quickRecoveryToggle = new MaterialSwitch(this);
+        quickRecoveryToggle.setText(tr("Show log recovery tile"));
+        quickRecoveryToggle.setTextColor(onSurface);
+        quickRecoveryToggle.setChecked(getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getBoolean(PREF_BETA_QUICK_SETTINGS_LOG_RECOVERY,
+                        DEFAULT_BETA_QUICK_SETTINGS_LOG_RECOVERY));
+        quickRecoveryToggle.setOnCheckedChangeListener((button, checked) -> {
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+                    .edit()
+                    .putBoolean(PREF_BETA_QUICK_SETTINGS_LOG_RECOVERY, checked)
+                    .apply();
+            setLogSessionRecoveryTileEnabled(checked);
+        });
+        quickRecoveryBody.addView(quickRecoveryToggle);
+        quickRecoveryBody.addView(supporting(
+                "Then add MindTrigger Assist from the phone's Quick Settings editor."),
+                margins(0, 0, 0, 0));
+        quickRecovery.addView(quickRecoveryBody);
+        root.addView(quickRecovery, margins(0, 0, 0, 14));
+
+        MaterialCardView sounds = sectionCard();
+        LinearLayout soundsBody = sectionBody();
+        soundsBody.addView(text("Custom activation sounds", 20, onSurface, Typeface.BOLD));
+        soundsBody.addView(supporting(
+                "Choose separate local audio for Circle to Search and Google Assistant. Playback is hard-limited to 3 seconds; compatible files are clipped during import."),
+                margins(0, 4, 0, 12));
+        soundsBody.addView(buildActivationSoundPicker(false));
+        soundsBody.addView(buildActivationSoundPicker(true), margins(0, 10, 0, 0));
+        sounds.addView(soundsBody);
+        root.addView(sounds, margins(0, 0, 0, 14));
+
+        MaterialCardView swap = sectionCard();
+        LinearLayout swapBody = sectionBody();
+        swapBody.addView(text("Swap CTS and Assistant", 20, onSurface, Typeface.BOLD));
+        swapBody.addView(supporting(
+                "Swap the Home/gesture and Power long-press actions: Home/gesture opens Assistant, while Power long press opens Circle to Search. Voice wake is not swapped."),
+                margins(0, 4, 0, 10));
+
+        MaterialSwitch swapActions = new MaterialSwitch(this);
+        swapActions.setText(tr("Swap CTS ↔ Google Assistant"));
+        swapActions.setTextColor(onSurface);
+        swapActions.setChecked(getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getBoolean(PREF_SWAP_CTS_ASSISTANT_EXPERIMENTAL,
+                        DEFAULT_SWAP_CTS_ASSISTANT_EXPERIMENTAL));
+        swapActions.setOnCheckedChangeListener((button, checked) -> {
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+                    .edit().putBoolean(PREF_SWAP_CTS_ASSISTANT_EXPERIMENTAL, checked).apply();
+            syncWatcherPrefs();
+        });
+        swapBody.addView(swapActions);
+        swap.addView(swapBody);
+        root.addView(swap);
+
+        scroll.addView(root);
+        return scroll;
+    }
+
+    private View buildActivationSoundPicker(boolean assistant) {
+        MaterialCardView shell = nestedCard();
+        LinearLayout block = column();
+        block.setPadding(dp(16), dp(16), dp(16), dp(16));
+
+        String title = assistant ? "Google Assistant" : "Circle to Search";
+        block.addView(text(title, 15, onSurface, Typeface.BOLD));
+
+        String description = ActivationSoundPlayer.describeCustomClip(this, assistant);
+        TextView status = supporting(description);
+        block.addView(status, margins(0, 4, 0, 10));
+
+        LinearLayout actions = new LinearLayout(this);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        actions.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+
+        MaterialButton choose = compactButton("Choose sound");
+        choose.setOnClickListener(v -> pickActivationSound(assistant));
+        actions.addView(choose);
+
+        if (ActivationSoundPlayer.hasCustomClip(this, assistant)) {
+            MaterialButton reset = compactButton("Reset");
+            reset.setOnClickListener(v -> {
+                ActivationSoundPlayer.resetCustomClip(this, assistant);
+                recreatePreservingTab();
+            });
+            actions.addView(reset, margins(8, 0, 0, 0));
+        }
+
+        block.addView(actions);
+        shell.addView(block);
+        return shell;
+    }
+
+    private void pickActivationSound(boolean assistant) {
+        Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        picker.addCategory(Intent.CATEGORY_OPENABLE);
+        picker.setType("audio/*");
+        picker.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+
+        try {
+            startActivityForResult(
+                    picker,
+                    assistant ? REQUEST_PICK_ASSISTANT_SOUND : REQUEST_PICK_CTS_SOUND);
+        } catch (Throwable error) {
+            Toast.makeText(this, tr("Audio picker unavailable"), Toast.LENGTH_SHORT).show();
+        }
+    }
+
 private View buildSupportPage() {
     ScrollView scroll = pageScroll();
     LinearLayout root = pageRoot();
 
     addTopBar(root, "Support me", "Support development");
+
+    root.addView(buildDonationCard(), margins(0, 0, 0, UI_CARD_GAP_DP));
 
     MaterialCardView hero = sectionCard();
     LinearLayout heroBody = sectionBody();
@@ -746,53 +1449,43 @@ private View buildSupportPage() {
     contribution.addView(contributionBody);
     root.addView(contribution, margins(0, 0, 0, 14));
 
-    MaterialCardView financial = sectionCard();
-    LinearLayout financialBody = sectionBody();
+    scroll.addView(root);
+    return scroll;
+}
 
-    financialBody.addView(text(
-            "Support on Ko-fi",
-            22,
-            onSurface,
-            Typeface.BOLD));
+private MaterialCardView buildDonationCard() {
+    MaterialCardView card = sectionCard();
+    card.setStrokeColor(Color.argb(
+            ThemeManager.isDark(this) ? 150 : 120,
+            Color.red(primary),
+            Color.green(primary),
+            Color.blue(primary)));
 
-    TextView financialDesc = supporting(
-            "If MindTrigger Assist is useful to you, you can support the student maintaining it through Ko-fi.");
-    financialBody.addView(
-            financialDesc,
+    LinearLayout body = sectionBody();
+    body.addView(text("Support on Ko-fi", 22, onSurface, Typeface.BOLD));
+    body.addView(supporting(
+            "If MindTrigger Assist is useful to you, you can support the student maintaining it through Ko-fi."),
             margins(0, 6, 0, 12));
 
-    MaterialButton kofiButton =
-            filledButton("Open Ko-fi · evokeruniverse");
-
-    kofiButton.setOnClickListener(v -> {
+    MaterialButton open = filledButton("Open Ko-fi · evokeruniverse");
+    open.setOnClickListener(v -> {
         try {
             startActivity(new Intent(
                     Intent.ACTION_VIEW,
                     Uri.parse("https://ko-fi.com/evokeruniverse")));
         } catch (Throwable e) {
-            Toast.makeText(
-                    this,
-                    tr("Unable to open Ko-fi."),
-                    Toast.LENGTH_LONG).show();
+            Toast.makeText(this, tr("Unable to open Ko-fi."), Toast.LENGTH_LONG).show();
         }
     });
+    body.addView(open);
 
-    financialBody.addView(kofiButton);
+    TextView url = supporting("ko-fi.com/evokeruniverse");
+    url.setTextColor(primary);
+    body.addView(url, margins(0, 8, 0, 0));
 
-    TextView kofiUrl = supporting(
-            "ko-fi.com/evokeruniverse");
-    kofiUrl.setTextColor(primary);
-    financialBody.addView(
-            kofiUrl,
-            margins(0, 8, 0, 0));
-
-    financial.addView(financialBody);
-    root.addView(financial);
-
-    scroll.addView(root);
-    return scroll;
+    card.addView(body);
+    return card;
 }
-
 
 private View buildAboutPage() {
     ScrollView scroll = pageScroll();
@@ -1102,11 +1795,10 @@ private void showLanguagePicker() {
 
     scroll.addView(group);
 
-    new MaterialAlertDialogBuilder(this)
+    showAppDialog(new MaterialAlertDialogBuilder(this)
             .setTitle(tr("Select language"))
             .setView(scroll)
-            .setNegativeButton(tr("Cancel"), null)
-            .show();
+            .setNegativeButton(tr("Cancel"), null));
 }
 
 
@@ -1120,46 +1812,43 @@ private void showOpenSourceLicenses() {
             tr("Audio asset provenance")
     };
 
-    new MaterialAlertDialogBuilder(this)
+    final String[] titles = {
+            "MindTrigger Assist — GPL-3.0-only",
+            "MiCTS — GPL-3.0",
+            "Apache License 2.0",
+            "Shizuku API — MIT",
+            "AndroidHiddenApiBypass — Apache-2.0",
+            "Audio asset provenance"
+    };
+    final int[] notices = {
+            R.raw.license_gpl_3_0,
+            R.raw.notice_micts,
+            R.raw.license_apache_2_0,
+            R.raw.license_shizuku_api_mit,
+            R.raw.notice_hidden_api_bypass,
+            R.raw.notice_audio_provenance
+    };
+
+    LinearLayout list = column();
+    list.setPadding(dp(8), 0, dp(8), 0);
+    for (int i = 0; i < labels.length; i++) {
+        final int index = i;
+        TextView row = text(labels[i], 16, onSurface, Typeface.NORMAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setMinHeight(dp(56));
+        row.setPadding(dp(12), dp(6), dp(12), dp(6));
+        row.setBackground(roundRect(surfaceContainerHigh, 14));
+        row.setClickable(true);
+        row.setOnClickListener(v -> showBundledNotice(titles[index], notices[index]));
+        list.addView(row, margins(0, i == 0 ? 0 : 8, 0, 0));
+    }
+
+    ScrollView scroll = new ScrollView(this);
+    scroll.addView(list);
+    showAppDialog(new MaterialAlertDialogBuilder(this)
             .setTitle(tr("Open-source licenses"))
-            .setItems(labels, (dialog, which) -> {
-                switch (which) {
-                    case 0:
-                        showBundledNotice(
-                                "MindTrigger Assist — GPL-3.0-only",
-                                R.raw.license_gpl_3_0);
-                        break;
-                    case 1:
-                        showBundledNotice(
-                                "MiCTS — GPL-3.0",
-                                R.raw.notice_micts);
-                        break;
-                    case 2:
-                        showBundledNotice(
-                                "Apache License 2.0",
-                                R.raw.license_apache_2_0);
-                        break;
-                    case 3:
-                        showBundledNotice(
-                                "Shizuku API — MIT",
-                                R.raw.license_shizuku_api_mit);
-                        break;
-                    case 4:
-                        showBundledNotice(
-                                "AndroidHiddenApiBypass — Apache-2.0",
-                                R.raw.notice_hidden_api_bypass);
-                        break;
-                    case 5:
-                        showBundledNotice(
-                                tr("Audio asset provenance"),
-                                R.raw.notice_audio_provenance);
-                        break;
-                    default:
-                        break;
-                }
-            })
-            .setNegativeButton(tr("Close"), null)
-            .show();
+            .setView(scroll)
+            .setPositiveButton(tr("Close"), null));
 }
 
 private void showBundledNotice(String title, int rawResId) {
@@ -1171,11 +1860,10 @@ private void showBundledNotice(String title, int rawResId) {
     ScrollView scroll = new ScrollView(this);
     scroll.addView(content);
 
-    new MaterialAlertDialogBuilder(this)
+    showAppDialog(new MaterialAlertDialogBuilder(this)
             .setTitle(tr(title))
             .setView(scroll)
-            .setPositiveButton(tr("Close"), null)
-            .show();
+            .setPositiveButton(tr("Close"), null));
 }
 
 private String readRawText(int rawResId) {
@@ -1279,7 +1967,7 @@ private void showTermsDialog(boolean firstRun) {
         builder.setPositiveButton(tr("Close"), null);
     }
 
-    builder.show();
+    showAppDialog(builder);
 }
 
 
@@ -1326,29 +2014,26 @@ private void addGestureRequirement(LinearLayout root) {
             required,
             margins(0, 2, 0, 10));
 
-    TextView manual = supporting(
-            "Follow the three screenshots below. The old direct System navigation button has been removed because it only opens an unrelated AOSP navigation UI on this ColorOS build.");
-    manual.setTextColor(onSurfaceVariant);
-    gestureSetupBlock.addView(
-            manual,
-            margins(0, 0, 0, 10));
+    gestureActionFeedback = statusText();
+    gestureActionFeedback.setVisibility(View.GONE);
+    gestureSetupBlock.addView(gestureActionFeedback, margins(0, 0, 0, 8));
 
     addGestureWalkthrough(gestureSetupBlock);
 
+    MaterialButton showRecovery = outlinedButton("Can't find the gesture switch?");
+    gestureSetupBlock.addView(showRecovery, margins(0, 12, 0, 0));
+
+    LinearLayout gestureRecovery = column();
+    gestureRecovery.setVisibility(View.GONE);
+
     TextView removal = supporting(
-            "First-run Shizuku setup removes com.heytap.speechassist and com.coloros.colordirectservice from user 0 with pm uninstall --user 0.");
+            "Shizuku setup removed SpeechAssist. Restore it briefly, enable the switch, then remove it again.");
     removal.setTextColor(warning);
-    gestureSetupBlock.addView(
+    gestureRecovery.addView(
             removal,
-            margins(0, 16, 0, 8));
+            margins(0, 12, 0, 8));
 
-    TextView missing = supporting(
-            "If the highlighted switch is missing, temporarily restore SpeechAssist, enable the switch using the guide above, then uninstall SpeechAssist again.");
-    gestureSetupBlock.addView(
-            missing,
-            margins(0, 0, 0, 8));
-
-    gestureSetupBlock.addView(
+    gestureRecovery.addView(
             miniTitle("Recovery · Restore SpeechAssist"),
             margins(0, 6, 0, 4));
 
@@ -1357,10 +2042,10 @@ private void addGestureRequirement(LinearLayout root) {
                     SetupCommands.speechAssistRestoreCommands());
     restoreCommand.setTypeface(Typeface.MONOSPACE);
     restoreCommand.setTextColor(onSurface);
-    gestureSetupBlock.addView(restoreCommand);
+    gestureRecovery.addView(restoreCommand);
 
     MaterialButton copyRestore =
-            outlinedButton("Copy restore commands");
+            outlinedButton("Copy ADB restore commands");
     copyRestore.setOnClickListener(v -> {
         copy(
                 "Restore SpeechAssist",
@@ -1369,19 +2054,22 @@ private void addGestureRequirement(LinearLayout root) {
                 this,
                 tr("Restore commands copied."),
                 Toast.LENGTH_SHORT).show();
+        setGestureActionFeedback(
+                "ADB restore commands copied. Run them on the connected computer, then return here.",
+                true);
     });
-    gestureSetupBlock.addView(
+    gestureRecovery.addView(
             copyRestore,
             margins(0, 8, 0, 8));
 
     TextView middle = supporting(
             "Then follow the three screenshots again and enable the highlighted ColorOS switch.");
     middle.setTextColor(onSurface);
-    gestureSetupBlock.addView(
+    gestureRecovery.addView(
             middle,
             margins(0, 4, 0, 8));
 
-    gestureSetupBlock.addView(
+    gestureRecovery.addView(
             miniTitle("Recovery · Remove SpeechAssist again"),
             margins(0, 4, 0, 4));
 
@@ -1390,10 +2078,10 @@ private void addGestureRequirement(LinearLayout root) {
                     SetupCommands.speechAssistRemoveCommand());
     removeCommand.setTypeface(Typeface.MONOSPACE);
     removeCommand.setTextColor(onSurface);
-    gestureSetupBlock.addView(removeCommand);
+    gestureRecovery.addView(removeCommand);
 
     MaterialButton copyRemove =
-            outlinedButton("Copy uninstall command");
+            outlinedButton("Copy ADB uninstall command");
     copyRemove.setOnClickListener(v -> {
         copy(
                 "Uninstall SpeechAssist",
@@ -1402,10 +2090,22 @@ private void addGestureRequirement(LinearLayout root) {
                 this,
                 tr("Uninstall command copied."),
                 Toast.LENGTH_SHORT).show();
+        setGestureActionFeedback(
+                "ADB uninstall command copied. Run it on the connected computer, then return here.",
+                true);
     });
-    gestureSetupBlock.addView(
+    gestureRecovery.addView(
             copyRemove,
             margins(0, 8, 0, 0));
+
+    showRecovery.setOnClickListener(v -> {
+        boolean show = gestureRecovery.getVisibility() != View.VISIBLE;
+        gestureRecovery.setVisibility(show ? View.VISIBLE : View.GONE);
+        showRecovery.setText(tr(show
+                ? "Hide recovery steps"
+                : "Can't find the gesture switch?"));
+    });
+    gestureSetupBlock.addView(gestureRecovery);
 
     TextView alreadyEnabled = supporting(
             "If a slight zoom animation already appears when you long-press the gesture guide bar, the entry point is probably active. You can skip recovery and confirm this step.");
@@ -1448,10 +2148,7 @@ private void addGestureRequirement(LinearLayout root) {
             gestureConfirmedBlock,
             margins(0, 10, 0, 0));
 
-    shell.addView(body);
-    root.addView(
-            shell,
-            margins(0, 0, 0, 16));
+    attachSetupSection(root, shell, body, 16);
 }
 
 private void addGestureWalkthrough(LinearLayout parent) {
@@ -1540,7 +2237,7 @@ private void addGestureGuideStep(
 
     MaterialCardView frame = elevatedCard(
             surfaceContainerHigh,
-            20,
+            UI_NESTED_CARD_RADIUS_DP,
             0f);
     frame.setStrokeColor(
             Color.argb(
@@ -1577,30 +2274,70 @@ private void showGestureGuideDialog() {
     addGestureWalkthrough(content);
     scroll.addView(content);
 
-    new MaterialAlertDialogBuilder(this)
+    showAppDialog(new MaterialAlertDialogBuilder(this)
             .setTitle(tr("ColorOS gesture guide"))
             .setView(scroll)
-            .setPositiveButton(tr("Close"), null)
-            .show();
+            .setPositiveButton(tr("Close"), null));
+}
+
+/**
+ * ColorOS can apply the device night overlay to a Material dialog even when
+ * this Activity is explicitly using the app's light palette.  Use the live
+ * palette after the window is attached so dialog chrome and custom content
+ * always agree on a foreground/background pair.
+ */
+private void showAppDialog(MaterialAlertDialogBuilder builder) {
+    androidx.appcompat.app.AlertDialog dialog = builder.create();
+    dialog.setOnShowListener(ignored -> {
+        Window window = dialog.getWindow();
+        if (window != null) {
+            window.setBackgroundDrawable(roundRect(surfaceContainer, 28));
+        }
+
+        TextView title = dialog.findViewById(androidx.appcompat.R.id.alertTitle);
+        if (title != null) title.setTextColor(onSurface);
+
+        TextView message = dialog.findViewById(android.R.id.message);
+        if (message != null) message.setTextColor(onSurfaceVariant);
+
+        android.widget.Button positive = dialog.getButton(
+                android.content.DialogInterface.BUTTON_POSITIVE);
+        if (positive != null) positive.setTextColor(primary);
+
+        android.widget.Button negative = dialog.getButton(
+                android.content.DialogInterface.BUTTON_NEGATIVE);
+        if (negative != null) negative.setTextColor(primary);
+    });
+    dialog.show();
 }
 
 
 private void confirmShizukuSetup() {
-    new MaterialAlertDialogBuilder(this)
+    try {
+        if (!Shizuku.pingBinder()) {
+            updatePrivilegedActionFeedback("SHIZUKU_NOT_RUNNING");
+            Toast.makeText(this, tr("Shizuku is not running."), Toast.LENGTH_LONG).show();
+            return;
+        }
+    } catch (Throwable t) {
+        updatePrivilegedActionFeedback("SHIZUKU_NOT_RUNNING");
+        Toast.makeText(this, tr("Shizuku is not available."), Toast.LENGTH_LONG).show();
+        return;
+    }
+
+    showAppDialog(new MaterialAlertDialogBuilder(this)
             .setTitle(tr("Confirm Shizuku setup"))
             .setMessage(tr("Shizuku first-run will grant privileged setup access and remove com.heytap.speechassist plus com.coloros.colordirectservice from user 0 using pm uninstall --user 0. The system-partition APKs are not erased. Continue only if you understand these changes."))
             .setNegativeButton(tr("Cancel"), null)
-            .setPositiveButton(tr("Continue"), (dialog, which) -> { dialog.dismiss(); if (bootstrap != null) bootstrap.runNow(); })
-            .show();
+            .setPositiveButton(tr("Continue"), (dialog, which) -> { dialog.dismiss(); if (bootstrap != null) bootstrap.runNow(); }));
 }
 
 private void confirmManualStep(String title, String warningText, Runnable onConfirmed) {
-    new MaterialAlertDialogBuilder(this)
+    showAppDialog(new MaterialAlertDialogBuilder(this)
             .setTitle(tr(title))
             .setMessage(tr(warningText))
             .setNegativeButton(tr("Cancel"), null)
-            .setPositiveButton(tr("I verified this setting"), (dialog, which) -> { dialog.dismiss(); onConfirmed.run(); refreshAll(); })
-            .show();
+            .setPositiveButton(tr("I verified this setting"), (dialog, which) -> { dialog.dismiss(); onConfirmed.run(); refreshAll(); }));
 }
 
 private LinearLayout confirmedManualRow(
@@ -1610,8 +2347,10 @@ private LinearLayout confirmedManualRow(
         View.OnClickListener listener) {
 
     LinearLayout row = column();
-    row.setPadding(dp(16), dp(14), dp(16), dp(14));
-    row.setBackground(roundRect(surfaceContainerHigh, 22));
+    row.setPadding(dp(16), dp(16), dp(16), dp(16));
+    row.setBackground(roundRect(
+            surfaceContainerHigh,
+            UI_NESTED_CARD_RADIUS_DP));
 
     row.addView(text(
             "✓ " + tr(title),
@@ -1656,7 +2395,10 @@ private void applyPressDepth(View view, float restZDp, float pressedZDp) {
 }
 
 private MaterialCardView priorityCard() {
-    MaterialCardView card = elevatedCard(surfaceContainer, 26, 0f);
+    MaterialCardView card = elevatedCard(
+            surfaceContainer,
+            UI_CARD_RADIUS_DP,
+            0f);
     card.setStrokeColor(Color.argb(
             120,
             Color.red(primary),
@@ -1726,10 +2468,12 @@ private MaterialButton themeModeButton(String label, String mode) {
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setGravity(Gravity.CENTER_VERTICAL);
-        bar.setPadding(dp(4), dp(12), dp(4), dp(18));
+        bar.setPadding(0, dp(12), 0, dp(16));
 
         LinearLayout titles = column();
-        titles.addView(text(titleText, 27, onSurface, Typeface.BOLD));
+        TextView pageTitle = text(titleText, 27, onSurface, Typeface.BOLD);
+        pageTitle.setLineSpacing(0, 1.02f);
+        titles.addView(pageTitle);
 
         TextView subtitle = text(
                 subtitleText,
@@ -1750,7 +2494,7 @@ private MaterialButton themeModeButton(String label, String mode) {
     }
 
     private void addHero(LinearLayout root) {
-        MaterialCardView hero = elevatedCard(surfaceContainerHigh, 30, 4f);
+        MaterialCardView hero = elevatedCard(surfaceContainerHigh, 24, 0f);
         hero.setStrokeColor(
                 Color.argb(
                         145,
@@ -1760,7 +2504,7 @@ private MaterialButton themeModeButton(String label, String mode) {
         hero.setStrokeWidth(dp(1));
 
         LinearLayout body = column();
-        body.setPadding(dp(22), dp(20), dp(22), dp(20));
+        body.setPadding(dp(20), dp(20), dp(20), dp(20));
 
         TextView eyebrow = text(
                 "CIRCLE TO SEARCH",
@@ -1796,7 +2540,7 @@ private MaterialButton themeModeButton(String label, String mode) {
         body.addView(rebootLogHint, margins(0, 12, 0, 0));
 
         hero.addView(body);
-        root.addView(hero, margins(0, 0, 0, 18));
+        root.addView(hero, margins(0, 0, 0, UI_CARD_GAP_DP));
     }
 
 
@@ -1805,8 +2549,8 @@ private void addCriticalRequirements(LinearLayout root) {
     MaterialCardView card =
             elevatedCard(
                     surfaceContainer,
-                    28,
-                    3f);
+                    UI_CARD_RADIUS_DP,
+                    0f);
 
     card.setStrokeWidth(dp(1));
     card.setStrokeColor(
@@ -1871,7 +2615,7 @@ private void addCriticalRequirements(LinearLayout root) {
     card.addView(body);
     root.addView(
             card,
-            margins(0, 2, 0, 16));
+            margins(0, 0, 0, UI_CARD_GAP_DP));
 }
 
 
@@ -1883,39 +2627,45 @@ private void addCriticalRequirements(LinearLayout root) {
                 body,
                 "1",
                 "Privileged setup",
-                "Grant the READ_LOGS package permission and apply the required device-side settings. Shizuku can perform this one-time setup without root.");
+                "Grant READ_LOGS once. Shizuku can do this without root.");
 
         step1Status = statusText();
         body.addView(step1Status, margins(0, 12, 0, 6));
 
         readLogsRow = actionRow(
                 "READ_LOGS permission",
-                "Package-level permission granted once and retained across reboot.",
+                "Granted once and kept after restart.",
                 "Check",
                 v -> refreshAll());
         body.addView(readLogsRow.root, margins(0, 6, 0, 0));
 
         logSessionRow = actionRow(
                 "Device log access session",
-                "Privileged logcat access is session-scoped. A new session may require Android's device-log access confirmation.",
+                "Android may ask again when this session reconnects.",
                 "Reconnect",
-                v -> requestLogSessionReconnect(true));
+                v -> armLogSessionReconnectWhenTop(true));
         body.addView(logSessionRow.root, margins(0, 8, 0, 0));
 
         step1Methods = new LinearLayout(this);
         step1Methods.setOrientation(LinearLayout.HORIZONTAL);
         step1Methods.setGravity(Gravity.CENTER_VERTICAL);
 
-        shizukuButton = filledTonalButton("Shizuku");
+        shizukuButton = filledTonalButton("Run setup with Shizuku");
         shizukuButton.setOnClickListener(v -> confirmShizukuSetup());
 
-        pcButton = outlinedButton("PC one-shot");
+        pcButton = outlinedButton("Copy ADB one-shot");
         pcButton.setOnClickListener(v -> {
             String cmd = SetupCommands.pcOneShot(getPackageName());
             copy("MindTrigger Assist one-shot", cmd);
             Toast.makeText(this,
-                    tr("Command copied. Run it once from a computer; the app will reopen after setup."),
+                    tr("ADB command copied. Run it once from a computer, then return to MindTrigger Assist."),
                     Toast.LENGTH_LONG).show();
+            if (privilegedActionFeedback != null) {
+                privilegedActionFeedback.setText(tr(
+                        "ADB one-shot copied. Waiting for you to run it on the connected computer."));
+                privilegedActionFeedback.setTextColor(primary);
+                privilegedActionFeedback.setVisibility(View.VISIBLE);
+            }
         });
 
         step1Methods.addView(shizukuButton, new LinearLayout.LayoutParams(
@@ -1923,26 +2673,33 @@ private void addCriticalRequirements(LinearLayout root) {
 
         LinearLayout.LayoutParams pcLp = new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        pcLp.setMargins(dp(8), 0, 0, 0);
+        pcLp.setMargins(dp(12), 0, 0, 0);
         step1Methods.addView(pcButton, pcLp);
 
         body.addView(step1Methods, margins(0, 10, 0, 0));
 
-        shell.addView(body);
-        root.addView(shell, margins(0, 0, 0, 14));
+        privilegedActionFeedback = statusText();
+        privilegedActionFeedback.setVisibility(View.GONE);
+        body.addView(privilegedActionFeedback, margins(0, 10, 0, 0));
+        if (!lastBootstrapUiState.isEmpty()) {
+            updatePrivilegedActionFeedback(lastBootstrapUiState);
+        }
+
+        attachSetupSection(root, shell, body, 14);
     }
 
 
 private void addStep2(LinearLayout root) {
     MaterialCardView shell = sectionCard();
     LinearLayout body = sectionBody();
-    addSectionHeader(body, "2", "Background reliability", "Keep the isolated watcher available. ColorOS Recent-task lock reduces process reclamation; Display over other apps enables the automatic Log Session Bridge path.");
+    addSectionHeader(body, "2", "Background reliability", "Keep MindTrigger running when ColorOS clears apps.");
     step2Status = statusText(); body.addView(step2Status, margins(0, 12, 0, 6));
 
     overlayRow = actionRow("Display over other apps", "Required for the transparent Log Session Bridge and the non-interactive watcher overlay.", "Open settings", v -> SettingsNavigator.overlay(this));
     body.addView(overlayRow.root, margins(0, 6, 0, 0));
     selfBatteryRow = actionRow("Battery optimization", "Recommended so ColorOS is less likely to restrict the isolated watcher in background.", "Open settings", v -> SettingsNavigator.requestBatteryExemption(this, getPackageName()));
     body.addView(selfBatteryRow.root, margins(0, 8, 0, 0));
+
     addGuide(body, "Background activity guide", R.drawable.guide_self_background);
 
     recentsSetupBlock = column();
@@ -1962,7 +2719,43 @@ private void addStep2(LinearLayout root) {
 
     recentsConfirmedBlock = confirmedManualRow("Recent-task lock confirmed", "The detailed guide is hidden because you already confirmed this step.", "Open again", v -> SettingsNavigator.homeScreenSettings(this));
     body.addView(recentsConfirmedBlock, margins(0, 14, 0, 0));
-    shell.addView(body); root.addView(shell, margins(0, 0, 0, 14));
+    attachSetupSection(root, shell, body, 14);
+}
+
+private MaterialCardView buildColorOsPermissionMonitoringWarning() {
+    MaterialCardView card = elevatedCard(
+            Color.argb(30, Color.red(error), Color.green(error), Color.blue(error)),
+            UI_CARD_RADIUS_DP,
+            0f);
+    card.setStrokeColor(error);
+    card.setStrokeWidth(dp(1));
+
+    LinearLayout body = column();
+    body.setPadding(dp(18), dp(18), dp(18), dp(18));
+
+    body.addView(text(
+            "ColorOS 16.0.7 · Disable permission monitoring",
+            17,
+            error,
+            Typeface.BOLD));
+    body.addView(supporting(
+            "For ColorOS 16.0.7, temporarily switch the system language to English. In Developer options, turn on Disable system optimization."),
+            margins(0, 6, 0, 0));
+    body.addView(supporting(
+            "This is your choice. If you do not agree, MindTrigger Assist may have background or privileged-setup problems."),
+            margins(0, 8, 0, 0));
+    body.addView(supporting(
+            "If you have already completed these steps, you can ignore this reminder."),
+            margins(0, 8, 0, 0));
+
+    MaterialButton developerOptions = outlinedButton("Open Developer options");
+    developerOptions.setStrokeColor(ColorStateList.valueOf(error));
+    developerOptions.setTextColor(error);
+    developerOptions.setOnClickListener(v -> SettingsNavigator.developerOptions(this));
+    body.addView(developerOptions, margins(0, 12, 0, 0));
+
+    card.addView(body);
+    return card;
 }
 
 
@@ -1973,11 +2766,9 @@ private void addStep3(LinearLayout root) {
 
     googleAssistantRow = actionRow(
             "Default assistant · Google",
-            "Set Google as the default Android assistant. MindTrigger Assist applies both assistant and voice_interaction_service secure settings during privileged setup.",
-            "Apply with Shizuku",
-            v -> {
-                if (bootstrap != null) bootstrap.runNow();
-            });
+            "Open Android's digital assistant settings to review or change the active assistant.",
+            "Assistant Settings",
+            v -> SettingsNavigator.assistantSettings(this));
     body.addView(googleAssistantRow.root, margins(0, 6, 0, 0));
 
     googleBatteryRow = actionRow("Google · Battery unrestricted", "Required for reliable Circle to Search activation.", "Fix", v -> SettingsNavigator.requestBatteryExemption(this, SetupCommands.GOOGLE));
@@ -2001,13 +2792,18 @@ private void addStep3(LinearLayout root) {
 
     autoLaunchConfirmedBlock = confirmedManualRow("Auto launch confirmed", "The detailed guide is hidden because you already confirmed this step.", "Open again", v -> SettingsNavigator.autoLaunch(this));
     body.addView(autoLaunchConfirmedBlock, margins(0, 14, 0, 0));
-    shell.addView(body); root.addView(shell, margins(0, 0, 0, 14));
+    attachSetupSection(root, shell, body, 14);
 }
 
     private void addRunCard(LinearLayout root) {
-        MaterialCardView shell = elevatedCard(surfaceContainerHigh, 28, 6f);
+        MaterialCardView shell = elevatedCard(
+                surfaceContainerHigh,
+                UI_CARD_RADIUS_DP,
+                0f);
+        shell.setStrokeColor(subtleOutline());
+        shell.setStrokeWidth(dp(1));
         LinearLayout body = column();
-        body.setPadding(dp(22), dp(20), dp(22), dp(20));
+        body.setPadding(dp(20), dp(20), dp(20), dp(20));
 
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.HORIZONTAL);
@@ -2032,15 +2828,14 @@ private void addStep3(LinearLayout root) {
             if (isWatcherRunning()
                     && watcherSessionState
                     != WatcherIpc.STATE_ACTIVE) {
-                requestLogSessionReconnect(true);
+                armLogSessionReconnectWhenTop(true);
             } else {
                 runWatcherWithGate();
             }
         });
         body.addView(runButton, margins(0, 14, 0, 0));
 
-        shell.addView(body);
-        root.addView(shell, margins(0, 0, 0, 18));
+        attachSetupSection(root, shell, body, 18);
     }
 
     private void runWatcherWithGate() {
@@ -2066,9 +2861,7 @@ private void addStep3(LinearLayout root) {
 
         statusPollRemaining = 120;
 
-        ui.postDelayed(
-                () -> requestLogSessionReconnect(true),
-                300L);
+        armLogSessionReconnectWhenTop(true);
     }
 
     private String firstMissingRequiredStep() {
@@ -2109,7 +2902,18 @@ private void addStep3(LinearLayout root) {
         return null;
     }
 
+    private boolean isUiReadyForUpdates() {
+        return uiReady
+                && !isFinishing()
+                && (Build.VERSION.SDK_INT < 17 || !isDestroyed());
+    }
+
+    private void refreshAllIfReady() {
+        if (isUiReadyForUpdates()) refreshAll();
+    }
+
     private void refreshAll() {
+        if (!isUiReadyForUpdates()) return;
         updateLastCommandTime();
         boolean readLogs = isReadLogsGranted();
         boolean overlay = Settings.canDrawOverlays(this);
@@ -2159,7 +2963,7 @@ private void addStep3(LinearLayout root) {
 
         if (criticalStatus != null) {
             criticalStatus.setText(
-                    checklistLine(readLogs, "READ_LOGS permission granted") + "\n" +
+                    checklistLine(readLogs, "READ_LOGS package permission granted · live session checked separately") + "\n" +
                     checklistLine(logSessionActive, "Device-log access session active") + "\n" +
                     checklistLine(gesture, "ColorOS long-press gesture confirmed") + "\n" +
                     checklistLine(recents, "Recent-task lock confirmed") + "\n" +
@@ -2246,8 +3050,8 @@ private void addStep3(LinearLayout root) {
         }
         shizukuButton.setEnabled(!step1Ready);
         pcButton.setEnabled(!step1Ready);
-        shizukuButton.setText("Shizuku");
-        pcButton.setText("PC one-shot");
+        shizukuButton.setText("Run setup with Shizuku");
+        pcButton.setText("Copy ADB one-shot");
 
         setStepStatus(
                 step2Status,
@@ -2273,25 +3077,22 @@ private void addStep3(LinearLayout root) {
 
         if (googleAssistantRow != null) {
             if (!googleInstalled) {
-                googleAssistantRow.status.setText(
-                        tr("Google is not installed"));
+                googleAssistantRow.status.setText(tr("Google is not installed"));
                 googleAssistantRow.status.setTextColor(onSurfaceVariant);
-                googleAssistantRow.button.setVisibility(View.VISIBLE);
-                googleAssistantRow.button.setEnabled(false);
-                googleAssistantRow.button.setText(tr("Unavailable"));
             } else {
-                setActionState(
-                        googleAssistantRow,
-                        googleAssistant,
+                googleAssistantRow.status.setText(tr(
                         googleAssistant
                                 ? "Google is selected as the default assistant"
-                                : "Google is not the default assistant");
-
-                if (!googleAssistant) {
-                    googleAssistantRow.button.setText(
-                            tr("Apply with Shizuku"));
-                }
+                                : "Google is not the default assistant"));
+                googleAssistantRow.status.setTextColor(
+                        googleAssistant ? success : onSurfaceVariant);
             }
+
+            // Always expose the Android settings surface. The privileged secure
+            // settings commands remain an internal bootstrap detail.
+            googleAssistantRow.button.setVisibility(View.VISIBLE);
+            googleAssistantRow.button.setEnabled(true);
+            googleAssistantRow.button.setText(tr("Assistant Settings"));
         }
 
         setPackageBatteryState(
@@ -2334,6 +3135,8 @@ private void addStep3(LinearLayout root) {
                             ? "Run MindTrigger Assist"
                             : "Complete setup first"));
         }
+
+        updateSetupWizardChrome();
     }
 
 
@@ -2526,22 +3329,111 @@ private void addStep3(LinearLayout root) {
         Intent intent = getIntent();
         if (intent != null) {
             intent.putExtra(EXTRA_RECREATE_TAB, currentTab);
+            intent.putExtra(EXTRA_RECREATE_SETUP_PAGE, currentSetupPage);
         }
         recreate();
     }
 
+    /**
+     * Programmatic tab navigation. This may synchronize the BottomNavigationView.
+     * User-originated BottomNavigationView callbacks MUST use
+     * showTabFromBottomNavigation() so they never call setSelectedItemId() again.
+     */
     private void showTab(int tab) {
-        if (tab < TAB_SETUP || tab > TAB_ABOUT) {
+        showTabInternal(tab, true);
+    }
+
+    /** Render a tab selected by the user in BottomNavigationView without re-entry. */
+    private void showTabFromBottomNavigation(int tab) {
+        showTabInternal(tab, false);
+    }
+
+    private void showTabInternal(int tab, boolean syncBottomNavigation) {
+        if (!isKnownTab(tab)) {
             tab = TAB_SETUP;
         }
+
+        int previousTab = currentTab;
         currentTab = tab;
 
         if (setupPage == null) return;
 
+        View incoming = pageForTab(tab);
+
+        setupPage.animate().cancel();
+        advancedPage.animate().cancel();
+        betaPage.animate().cancel();
+        supportPage.animate().cancel();
+        aboutPage.animate().cancel();
+
         setupPage.setVisibility(tab == TAB_SETUP ? View.VISIBLE : View.GONE);
         advancedPage.setVisibility(tab == TAB_ADVANCED ? View.VISIBLE : View.GONE);
+        betaPage.setVisibility(tab == TAB_BETA ? View.VISIBLE : View.GONE);
         supportPage.setVisibility(tab == TAB_SUPPORT ? View.VISIBLE : View.GONE);
         aboutPage.setVisibility(tab == TAB_ABOUT ? View.VISIBLE : View.GONE);
+
+        boolean slowMotion = getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getBoolean(PREF_BETA_SLOW_ANIMATIONS,
+                        DEFAULT_BETA_SLOW_ANIMATIONS);
+
+        if (previousTab != tab
+                && !setupWizardActive
+                && incoming != null) {
+            incoming.setAlpha(0f);
+            incoming.setScaleX(0.985f);
+            incoming.setScaleY(0.985f);
+            incoming.setTranslationY(dp(10));
+            incoming.animate()
+                    .alpha(1f)
+                    .scaleX(1f)
+                    .scaleY(1f)
+                    .translationY(0f)
+                    .setInterpolator(new android.view.animation.PathInterpolator(
+                            0.2f, 0f, 0f, 1f))
+                    .setDuration(slowMotion ? 440L : 240L)
+                    .start();
+        } else if (incoming != null) {
+            incoming.setAlpha(1f);
+            incoming.setScaleX(1f);
+            incoming.setScaleY(1f);
+            incoming.setTranslationY(0f);
+        }
+
+        // Hide app navigation only while the one-time onboarding wizard is
+        // active. After onboarding, Setup is a normal scrollable bottom-nav tab.
+        if (bottomNav != null) {
+            boolean hideForWizard = setupWizardActive && tab == TAB_SETUP;
+            bottomNav.setVisibility(hideForWizard ? View.GONE : View.VISIBLE);
+            if (syncBottomNavigation
+                    && !hideForWizard
+                    && bottomNav.getSelectedItemId() != tab) {
+                bottomNav.setSelectedItemId(tab);
+            }
+        }
+
+        if (tab == TAB_SETUP && setupWizardActive) {
+            updateSetupWizardChrome();
+            if (setupScroll != null) {
+                setupScroll.post(() -> setupScroll.scrollTo(0, 0));
+            }
+        }
+    }
+
+    private boolean isKnownTab(int tab) {
+        return tab == TAB_SETUP
+                || tab == TAB_ADVANCED
+                || tab == TAB_BETA
+                || tab == TAB_SUPPORT
+                || tab == TAB_ABOUT;
+    }
+
+    private View pageForTab(int tab) {
+        if (tab == TAB_SETUP) return setupPage;
+        if (tab == TAB_ADVANCED) return advancedPage;
+        if (tab == TAB_BETA) return betaPage;
+        if (tab == TAB_SUPPORT) return supportPage;
+        if (tab == TAB_ABOUT) return aboutPage;
+        return null;
     }
 
     private String checklistLine(boolean done, String label) {
@@ -2642,7 +3534,7 @@ private void addStep3(LinearLayout root) {
         MaterialCardView shell = nestedCard();
 
         LinearLayout row = column();
-        row.setPadding(dp(16), dp(14), dp(16), dp(14));
+        row.setPadding(dp(16), dp(16), dp(16), dp(16));
 
         row.addView(text(
                 title,
@@ -2658,7 +3550,7 @@ private void addStep3(LinearLayout root) {
                 12,
                 onSurfaceVariant,
                 Typeface.BOLD);
-        row.addView(status, margins(0, 6, 0, 8));
+        row.addView(status, margins(0, 6, 0, 10));
 
         MaterialButton button = compactButton(action);
         button.setOnClickListener(listener);
@@ -2683,7 +3575,7 @@ private void addStep3(LinearLayout root) {
 
         LinearLayout line = new LinearLayout(this);
         line.setOrientation(LinearLayout.HORIZONTAL);
-        line.setGravity(Gravity.TOP);
+        line.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView numberText = text(
                 number,
@@ -2701,7 +3593,7 @@ private void addStep3(LinearLayout root) {
                 new LinearLayout.LayoutParams(
                         dp(36),
                         dp(36));
-        numberLp.setMargins(0, dp(2), dp(12), 0);
+        numberLp.setMargins(0, 0, dp(12), 0);
         line.addView(numberText, numberLp);
 
         LinearLayout copy = column();
@@ -2711,6 +3603,7 @@ private void addStep3(LinearLayout root) {
                 20,
                 onSurface,
                 Typeface.BOLD);
+        titleView.setIncludeFontPadding(false);
         titleView.setMaxLines(3);
         copy.addView(titleView);
 
@@ -2768,17 +3661,20 @@ private void addStep3(LinearLayout root) {
     private ScrollView pageScroll() {
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
-        android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable(
-                android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM,
-                new int[] { surface, surface, surfaceContainer });
-        scroll.setBackground(bg);
+        // A single surface behind every independent tab keeps the content
+        // edge visually stable while cards scroll underneath it.
+        scroll.setBackgroundColor(surface);
         scroll.setClipToPadding(false);
         return scroll;
     }
 
     private LinearLayout pageRoot() {
         LinearLayout root = column();
-        root.setPadding(dp(20), dp(10), dp(20), dp(32));
+        root.setPadding(
+                dp(UI_PAGE_SIDE_DP),
+                dp(UI_PAGE_TOP_DP),
+                dp(UI_PAGE_SIDE_DP),
+                dp(UI_PAGE_BOTTOM_DP));
         return root;
     }
 
@@ -2789,14 +3685,22 @@ private void addStep3(LinearLayout root) {
     }
 
     private MaterialCardView sectionCard() {
-        MaterialCardView card = elevatedCard(surfaceContainer, 24, 0f);
-        card.setStrokeWidth(0);
+        MaterialCardView card = elevatedCard(
+                surfaceContainer,
+                UI_CARD_RADIUS_DP,
+                0f);
+        card.setStrokeColor(subtleOutline());
+        card.setStrokeWidth(dp(1));
         return card;
     }
 
     private MaterialCardView nestedCard() {
-        MaterialCardView card = elevatedCard(surfaceContainerHigh, 20, 0f);
-        card.setStrokeWidth(0);
+        MaterialCardView card = elevatedCard(
+                surfaceContainerHigh,
+                UI_NESTED_CARD_RADIUS_DP,
+                0f);
+        card.setStrokeColor(subtleOutline());
+        card.setStrokeWidth(dp(1));
         return card;
     }
 
@@ -2811,13 +3715,15 @@ private void addStep3(LinearLayout root) {
         card.setCardElevation(dp(Math.min(1f, Math.max(0f, elevationDp))));
         card.setUseCompatPadding(false);
         card.setPreventCornerOverlap(true);
+        card.setStateListAnimator(null);
+        card.setElevation(0f);
         card.setTranslationZ(0f);
         return card;
     }
 
     private LinearLayout sectionBody() {
         LinearLayout body = column();
-        body.setPadding(dp(22), dp(20), dp(22), dp(20));
+        body.setPadding(dp(20), dp(18), dp(20), dp(18));
         return body;
     }
 
@@ -2837,7 +3743,7 @@ private void addStep3(LinearLayout root) {
 
     private TextView supporting(String value) {
         TextView v = text(value, 15, onSurfaceVariant, Typeface.NORMAL);
-        v.setLineSpacing(0, 1.12f);
+        v.setLineSpacing(dp(1), 1.12f);
         return v;
     }
 
@@ -2881,7 +3787,7 @@ private void addStep3(LinearLayout root) {
         b.setText(tr(label));
         b.setTextSize(13);
         b.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        b.setMinHeight(dp(40));
+        b.setMinHeight(dp(44));
         b.setMinWidth(dp(72));
         b.setCornerRadius(dp(20));
         b.setInsetTop(0);
@@ -2910,6 +3816,14 @@ private void addStep3(LinearLayout root) {
         b.setElevation(0f);
         applyPressDepth(b, 0f, 0f);
         return b;
+    }
+
+    private int subtleOutline() {
+        return Color.argb(
+                ThemeManager.isDark(this) ? 54 : 76,
+                Color.red(outline),
+                Color.green(outline),
+                Color.blue(outline));
     }
 
     private ColorStateList flatTint(int color) {
@@ -3008,6 +3922,47 @@ private void addStep3(LinearLayout root) {
     }
 
 
+
+private void armLogSessionReconnectWhenTop(boolean force) {
+    pendingTopLogReconnect = true;
+    pendingTopLogReconnectForce |= force;
+
+    if (activityResumed && activityHasWindowFocus) {
+        maybeRunTopLogReconnect();
+    }
+}
+
+private void maybeRunTopLogReconnect() {
+    if (!pendingTopLogReconnect
+            || topLogReconnectScheduled
+            || !activityResumed
+            || !activityHasWindowFocus) {
+        return;
+    }
+
+    topLogReconnectScheduled = true;
+
+    // LogcatManagerService only displays its confirmation when the requesting
+    // UID is PROCESS_STATE_TOP. Window focus is a stronger signal than
+    // onResume() on OEM builds, and the short delay lets ActivityManager commit
+    // the TOP state before :watcher opens a new logd reader.
+    ui.postDelayed(
+            () -> {
+                topLogReconnectScheduled = false;
+
+                if (!pendingTopLogReconnect
+                        || !activityResumed
+                        || !activityHasWindowFocus) {
+                    return;
+                }
+
+                final boolean force = pendingTopLogReconnectForce;
+                pendingTopLogReconnect = false;
+                pendingTopLogReconnectForce = false;
+                requestLogSessionReconnect(force);
+            },
+            360L);
+}
 
 private void requestLogSessionReconnect(
         boolean force) {
@@ -3275,11 +4230,42 @@ private void syncWatcherPrefs() {
                     PREF_POWER_GEMINI_EXPERIMENTAL,
                     DEFAULT_POWER_GEMINI_EXPERIMENTAL));
 
+    data.putBoolean(
+            WatcherIpc.KEY_VOICE_WAKE_ASSISTANT,
+            prefs.getBoolean(
+                    PREF_VOICE_WAKE_ASSISTANT_EXPERIMENTAL,
+                    DEFAULT_VOICE_WAKE_ASSISTANT_EXPERIMENTAL));
+
+    data.putBoolean(
+            WatcherIpc.KEY_SWAP_CTS_ASSISTANT,
+            prefs.getBoolean(
+                    PREF_SWAP_CTS_ASSISTANT_EXPERIMENTAL,
+                    DEFAULT_SWAP_CTS_ASSISTANT_EXPERIMENTAL));
+
     sendWatcherMessage(
             WatcherIpc.MSG_SYNC_PREFS,
             data,
             false);
 }
+
+    private void setLogSessionRecoveryTileEnabled(boolean enabled) {
+        try {
+            ComponentName component = new ComponentName(
+                    this,
+                    LogSessionRecoveryTileService.class);
+            getPackageManager().setComponentEnabledSetting(
+                    component,
+                    enabled
+                            ? PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+                            : PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                    PackageManager.DONT_KILL_APP);
+        } catch (Throwable error) {
+            Toast.makeText(
+                    this,
+                    tr("Unable to update the Quick Settings tile."),
+                    Toast.LENGTH_SHORT).show();
+        }
+    }
 
     private void startWatcher() {
         Intent i = new Intent(this, HomeHoldService.class);

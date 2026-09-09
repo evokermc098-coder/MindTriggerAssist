@@ -31,7 +31,7 @@ final class LanguageManager {
 
     private static final String[] LABELS = {
             "🇻🇳 Tiếng Việt",
-            "English",
+            "\uD83C\uDDFA\uD83C\uDDF8 English",
             "🇮🇩 Bahasa Indonesia",
             "🇹🇭 ไทย"
     };

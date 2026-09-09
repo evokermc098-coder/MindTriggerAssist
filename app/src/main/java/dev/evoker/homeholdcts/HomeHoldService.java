@@ -6,7 +6,10 @@ package dev.evoker.homeholdcts;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.graphics.PixelFormat;
 import android.os.Build;
 import android.os.Bundle;
@@ -14,17 +17,17 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.Message;
+import android.os.PowerManager;
 import android.os.Messenger;
 import android.os.RemoteException;
 import android.os.SystemClock;
 import android.provider.Settings;
+import android.content.pm.ServiceInfo;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -37,6 +40,8 @@ public class HomeHoldService extends Service {
             "dev.evoker.homeholdcts.STOP";
     public static final String ACTION_RECONNECT_LOGCAT =
             "dev.evoker.homeholdcts.RECONNECT_LOGCAT";
+    public static final String ACTION_REFRESH_FGS =
+            "dev.evoker.homeholdcts.REFRESH_FGS";
 
     private static final String CHANNEL =
             WatcherNotificationHelper.CHANNEL;
@@ -51,28 +56,34 @@ public class HomeHoldService extends Service {
             "Detect long press KEYCODE_POWER";
     private static final String POWER_MONITOR_TEXT =
             "PowerKey:onLongPress";
-    private static final String SESSION_PROBE_PREFIX =
-            "HOMEHOLD_LOG_SESSION_PROBE_";
-
+    private static final String VOICE_WAKE_CALLER_TEXT =
+            "wakeUpSpeechAssist caller_package: com.oplus.ovoicemanager.wakeup";
     private static final long POWER_MARKER_WINDOW_MS = 500L;
+    private static final long VOICE_WAKE_MARKER_WINDOW_MS = 1000L;
     private static final long DEBOUNCE_MS = 2500L;
     private static final long AUTO_RECOVERY_SURFACE_CHECK_MS = 1400L;
+    private static final long RECOVERY_RETRY_ARM_MS = 15_000L;
+    private static final int MAX_AUTO_RECOVERY_ATTEMPTS = 3;
+    private static final long LEASE_RENEW_MS = 2L * 60L * 1000L;
 
     private final Object reconnectLock = new Object();
-    private final Object logcatLock = new Object();
+    private final Object logSessionLock = new Object();
+    private final Object triggerLock = new Object();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     private volatile boolean running;
     private volatile boolean reconnectRequested;
     private volatile boolean reconnectInFlight;
     private volatile boolean autoRecoveryAttemptedForCurrentLoss;
+    private volatile int autoRecoveryAttempts;
 
     private volatile int logSessionState =
             WatcherIpc.STATE_STOPPED;
 
-    private volatile Process logcatProcess;
+    private volatile SingleDirectLogdSession directLogdSession;
     private volatile long lastTriggerElapsed;
     private volatile long lastPowerLongPressElapsed;
+    private volatile long lastVoiceWakeElapsed;
 
     private volatile int runtimeDelayMs =
             MainActivity.DEFAULT_CTS_DELAY_MS;
@@ -82,11 +93,59 @@ public class HomeHoldService extends Service {
             MainActivity.DEFAULT_SOUND_ON_ACTIVATION;
     private volatile boolean runtimePowerGemini =
             MainActivity.DEFAULT_POWER_GEMINI_EXPERIMENTAL;
+    private volatile boolean runtimeVoiceWakeAssistant =
+            MainActivity.DEFAULT_VOICE_WAKE_ASSISTANT_EXPERIMENTAL;
+    private volatile boolean runtimeSwapCtsAssistant =
+            MainActivity.DEFAULT_SWAP_CTS_ASSISTANT_EXPERIMENTAL;
 
     private ExecutorService executor;
     private ActivationRunner activationRunner;
-    private WindowManager windowManager;
-    private View keepAliveOverlay;
+    private OverlayGuardian overlayGuardian;
+    private boolean wakeReceiverRegistered;
+
+    private final Runnable leaseRenewRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!running || !isEnabled()) {
+                return;
+            }
+            RestartReceiver.armLease(HomeHoldService.this);
+            WatcherRescueJobService.ensureScheduled(HomeHoldService.this);
+            mainHandler.postDelayed(this, LEASE_RENEW_MS);
+        }
+    };
+
+    private final BroadcastReceiver wakeReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (!running || !isEnabled() || intent == null) {
+                return;
+            }
+
+            String action = intent.getAction();
+            if (overlayGuardian != null) {
+                overlayGuardian.onSystemTransition(action);
+            } else {
+                ensureKeepAliveOverlay();
+            }
+            startWatcherForeground(
+                    WatcherNotificationHelper.buildWatcherNotification(
+                            HomeHoldService.this,
+                            logSessionState));
+
+            // SCREEN_ON is used as a health nudge only. USER_PRESENT is the
+            // safe moment to surface Android's mandatory log-access dialog if
+            // the watcher/socket died while the phone was asleep.
+            if (Intent.ACTION_USER_PRESENT.equals(action)
+                    && logSessionState == WatcherIpc.STATE_NEEDS_RECONNECT) {
+                autoRecoveryAttemptedForCurrentLoss = false;
+                autoRecoveryAttempts = 0;
+                mainHandler.postDelayed(
+                        () -> maybeAutoRecoverLogSession("user-present"),
+                        180L);
+            }
+        }
+    };
 
     private Messenger clientMessenger;
 
@@ -147,13 +206,18 @@ public class HomeHoldService extends Service {
         setLogSessionState(
                 WatcherIpc.STATE_NEEDS_RECONNECT);
 
-        startForeground(
-                NOTIFICATION_ID,
+        startWatcherForeground(
                 WatcherNotificationHelper.buildWatcherNotification(
                         this,
                         WatcherIpc.STATE_NEEDS_RECONNECT));
 
-        ensureKeepAliveOverlay();
+        overlayGuardian = new OverlayGuardian(this);
+        overlayGuardian.start();
+        registerWakeReceiver();
+        RestartReceiver.armLease(this);
+        WatcherRescueJobService.ensureScheduled(this);
+        mainHandler.removeCallbacks(leaseRenewRunnable);
+        mainHandler.postDelayed(leaseRenewRunnable, LEASE_RENEW_MS);
 
         activationRunner = new ActivationRunner(this);
         executor = Executors.newSingleThreadExecutor();
@@ -161,11 +225,58 @@ public class HomeHoldService extends Service {
         running = true;
         executor.execute(this::watchForever);
 
-        // Recovery is integrated in V7: after reboot/process recreation,
-        // make at most one foreground-surface attempt.
+        // V5 recovery: if the watcher was recreated while the screen is
+        // interactive, surface the tiny TOP bridge. If the screen is off the
+        // request is deferred until USER_PRESENT.
         mainHandler.postDelayed(
                 () -> maybeAutoRecoverLogSession("service-start"),
                 900L);
+    }
+
+    /**
+     * Retain specialUse as the safe baseline and add systemExempted when the
+     * package is currently exempt from battery optimizations via the one-shot
+     * Doze allowlist setup. Device Admin is intentionally not used.
+     */
+    private void startWatcherForeground(android.app.Notification notification) {
+        if (Build.VERSION.SDK_INT < 34) {
+            startForeground(NOTIFICATION_ID, notification);
+            return;
+        }
+
+        int serviceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE;
+        if (isSystemExemptedEligible()) {
+            serviceType |= ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED;
+        }
+
+        try {
+            startForeground(NOTIFICATION_ID, notification, serviceType);
+        } catch (RuntimeException systemExemptedFailure) {
+            if ((serviceType & ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED) == 0) {
+                throw systemExemptedFailure;
+            }
+
+            // OEM device-policy/power state can race service startup. Never
+            // sacrifice the existing watcher merely because the stronger type
+            // was temporarily rejected.
+            Log.w(TAG, "systemExempted FGS rejected; falling back to specialUse",
+                    systemExemptedFailure);
+            startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+        }
+    }
+
+    private boolean isSystemExemptedEligible() {
+        try {
+            PowerManager power = getSystemService(PowerManager.class);
+            return power != null
+                    && power.isIgnoringBatteryOptimizations(getPackageName());
+        } catch (Throwable t) {
+            Log.w(TAG, "Doze allowlist eligibility check failed", t);
+            return false;
+        }
     }
 
     @Override
@@ -182,6 +293,16 @@ public class HomeHoldService extends Service {
         }
 
         ensureKeepAliveOverlay();
+        RestartReceiver.armLease(this);
+        WatcherRescueJobService.ensureScheduled(this);
+
+        if (intent != null
+                && ACTION_REFRESH_FGS.equals(intent.getAction())) {
+            startWatcherForeground(
+                    WatcherNotificationHelper.buildWatcherNotification(
+                            this,
+                            logSessionState));
+        }
 
         if (!running
                 && executor != null
@@ -208,6 +329,7 @@ public class HomeHoldService extends Service {
     public void onTaskRemoved(Intent rootIntent) {
         if (isEnabled()) {
             RestartReceiver.scheduleRestart(this, 1200L);
+            WatcherRescueJobService.ensureScheduled(this);
         }
         super.onTaskRemoved(rootIntent);
     }
@@ -226,7 +348,7 @@ public class HomeHoldService extends Service {
             activationRunner = null;
         }
 
-        destroyCurrentLogcatAndWait();
+        closeCurrentLogdSession();
 
         if (executor != null) {
             executor.shutdownNow();
@@ -239,6 +361,8 @@ public class HomeHoldService extends Service {
             }
         }
 
+        unregisterWakeReceiver();
+        mainHandler.removeCallbacks(leaseRenewRunnable);
         removeKeepAliveOverlay();
         setLogSessionState(WatcherIpc.STATE_STOPPED);
 
@@ -259,6 +383,8 @@ public class HomeHoldService extends Service {
                         MainActivity.PREF_ENABLED,
                         false)
                 .commit();
+        RestartReceiver.cancelRestart(this);
+        WatcherRescueJobService.cancelScheduled(this);
         stopSelf();
     }
 
@@ -314,6 +440,16 @@ public class HomeHoldService extends Service {
                 prefs.getBoolean(
                         MainActivity.PREF_POWER_GEMINI_EXPERIMENTAL,
                         MainActivity.DEFAULT_POWER_GEMINI_EXPERIMENTAL);
+
+        runtimeVoiceWakeAssistant =
+                prefs.getBoolean(
+                        MainActivity.PREF_VOICE_WAKE_ASSISTANT_EXPERIMENTAL,
+                        MainActivity.DEFAULT_VOICE_WAKE_ASSISTANT_EXPERIMENTAL);
+
+        runtimeSwapCtsAssistant =
+                prefs.getBoolean(
+                        MainActivity.PREF_SWAP_CTS_ASSISTANT_EXPERIMENTAL,
+                        MainActivity.DEFAULT_SWAP_CTS_ASSISTANT_EXPERIMENTAL);
     }
 
     private void applyRuntimePrefs(Bundle data) {
@@ -341,6 +477,16 @@ public class HomeHoldService extends Service {
                 data.getBoolean(
                         WatcherIpc.KEY_POWER_GEMINI,
                         runtimePowerGemini);
+
+        runtimeVoiceWakeAssistant =
+                data.getBoolean(
+                        WatcherIpc.KEY_VOICE_WAKE_ASSISTANT,
+                        runtimeVoiceWakeAssistant);
+
+        runtimeSwapCtsAssistant =
+                data.getBoolean(
+                        WatcherIpc.KEY_SWAP_CTS_ASSISTANT,
+                        runtimeSwapCtsAssistant);
     }
 
     private int clampDelay(int value) {
@@ -368,7 +514,7 @@ public class HomeHoldService extends Service {
         }
 
         reconnectInFlight = true;
-        destroyCurrentLogcatAndWait();
+        closeCurrentLogdSession();
 
         synchronized (reconnectLock) {
             reconnectRequested = true;
@@ -421,138 +567,156 @@ public class HomeHoldService extends Service {
     }
 
     private void runOneLogSession() {
-        String probe =
-                SESSION_PROBE_PREFIX
-                        + SystemClock.elapsedRealtime();
+        final long listenerStarted = SystemClock.elapsedRealtime();
+        final boolean[] sessionWasActive = new boolean[] { false };
 
-        boolean sessionWasActive = false;
+        SingleDirectLogdSession session = new SingleDirectLogdSession(
+                new SingleDirectLogdSession.Listener() {
+                    @Override
+                    public void onActive() {
+                        sessionWasActive[0] = true;
+                        reconnectInFlight = false;
+                        setLogSessionState(WatcherIpc.STATE_ACTIVE);
+                    }
+
+                    @Override
+                    public void onLine(String line) {
+                        if (SystemClock.elapsedRealtime()
+                                - listenerStarted < 700L) {
+                            return;
+                        }
+                        handleTriggerLine(line);
+                    }
+
+                    @Override
+                    public void onAllLanesLost(String reason) {
+                        if (running && isEnabled()) {
+                            Log.w(TAG, "Direct logd session lost: " + reason);
+                        }
+                    }
+                });
 
         try {
-            ProcessBuilder pb =
-                    new ProcessBuilder(
-                            "logcat",
-                            "-b", "all",
-                            "-v", "brief",
-                            "-T", "1",
-                            "ActivityManager:W",
-                            "KEYLOG_SingleKeyGesture:I",
-                            "KEYLOG_SinglePowerKeyMonitor:V",
-                            "HomeHoldCTS:I",
-                            "*:S"
-                    );
-
-            pb.redirectErrorStream(true);
-            Process created = pb.start();
-
-            synchronized (logcatLock) {
-                logcatProcess = created;
+            synchronized (logSessionLock) {
+                directLogdSession = session;
             }
 
-            long listenerStarted =
-                    SystemClock.elapsedRealtime();
+            session.start();
+            session.awaitTermination();
 
-            BufferedReader br =
-                    new BufferedReader(
-                            new InputStreamReader(
-                                    created.getInputStream()));
-
-            Log.i(TAG, probe);
-
-            String line;
-
-            while (running
-                    && isEnabled()
-                    && (line = br.readLine()) != null) {
-
-                if (!sessionWasActive) {
-                    sessionWasActive = true;
-                    reconnectInFlight = false;
-                    setLogSessionState(
-                            WatcherIpc.STATE_ACTIVE);
-                }
-
-                if (line.contains(probe)) {
-                    continue;
-                }
-
-                if (SystemClock.elapsedRealtime()
-                        - listenerStarted < 700L) {
-                    continue;
-                }
-
-                long now =
-                        SystemClock.elapsedRealtime();
-
-                if (line.contains(POWER_LONG_PRESS_TEXT)
-                        || line.contains(POWER_MONITOR_TEXT)) {
-                    lastPowerLongPressElapsed = now;
-                    continue;
-                }
-
-                if (line.contains(ACTION_TEXT)
-                        && line.contains(COMPONENT_TEXT)) {
-
-                    if (now - lastTriggerElapsed
-                            < DEBOUNCE_MS) {
-                        continue;
-                    }
-
-                    lastTriggerElapsed = now;
-
-                    boolean fromPower =
-                            lastPowerLongPressElapsed > 0L
-                                    && now
-                                    - lastPowerLongPressElapsed >= 0L
-                                    && now
-                                    - lastPowerLongPressElapsed
-                                    <= POWER_MARKER_WINDOW_MS;
-
-                    if (fromPower
-                            && runtimePowerGemini) {
-                        if (activationRunner != null) {
-                            activationRunner
-                                    .activateAssistantSession(
-                                            runtimeDelayMs,
-                                            runtimeVibrate,
-                                            runtimeSound);
-                        }
-                    } else {
-                        if (activationRunner != null) {
-                            activationRunner
-                                    .activateCts(
-                                            runtimeDelayMs,
-                                            runtimeVibrate,
-                                            runtimeSound);
-                        }
-                    }
-                }
-            }
-
-            try {
-                br.close();
-            } catch (Throwable ignored) {
-            }
-
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
         } catch (Throwable e) {
-            Log.e(
-                    TAG,
-                    "Logcat watcher session failed",
-                    e);
-
+            if (running && isEnabled()) {
+                Log.e(TAG, "Single direct-logd watcher failed", e);
+            }
         } finally {
-            destroyCurrentLogcatAndWait();
+            closeCurrentLogdSession();
             reconnectInFlight = false;
 
             if (running && isEnabled()) {
-                setLogSessionState(
-                        WatcherIpc.STATE_NEEDS_RECONNECT);
+                setLogSessionState(WatcherIpc.STATE_NEEDS_RECONNECT);
 
-                // Only a previously ACTIVE session gets automatic recovery.
-                // A deny/timeout while CONNECTING must not loop.
-                if (sessionWasActive) {
-                    mainHandler.post(
-                            () -> maybeAutoRecoverLogSession(
-                                    "active-session-lost"));
+                final boolean wasEverActive =
+                        sessionWasActive[0] || session.wasEverActive();
+                if (!wasEverActive) {
+                    // The bridge marks this loss as attempted before asking
+                    // logd to connect. A never-active socket must clear that
+                    // per-attempt gate so bounded recovery can continue.
+                    autoRecoveryAttemptedForCurrentLoss = false;
+                }
+
+                // A connection failure before the first packet also needs the
+                // existing TOP/focus-gated recovery path. Otherwise the
+                // watcher waits indefinitely for an external reconnect.
+                mainHandler.post(
+                        () -> maybeAutoRecoverLogSession(
+                                wasEverActive
+                                        ? "single-direct-logd-session-lost"
+                                        : "session-never-active"));
+            }
+        }
+    }
+
+    private void handleTriggerLine(String line) {
+        if (line == null || line.isEmpty()) {
+            return;
+        }
+
+        synchronized (triggerLock) {
+            long now = SystemClock.elapsedRealtime();
+
+            if (line.contains(VOICE_WAKE_CALLER_TEXT)) {
+                lastVoiceWakeElapsed = now;
+                Log.i(TAG, "Voice wake marker captured from OVoiceManager");
+                return;
+            }
+
+            if (line.contains(POWER_LONG_PRESS_TEXT)
+                    || line.contains(POWER_MONITOR_TEXT)) {
+                lastPowerLongPressElapsed = now;
+                return;
+            }
+
+            if (!line.contains(ACTION_TEXT)
+                    || !line.contains(COMPONENT_TEXT)) {
+                return;
+            }
+
+            if (now - lastTriggerElapsed < DEBOUNCE_MS) {
+                return;
+            }
+
+            lastTriggerElapsed = now;
+
+            boolean fromPower =
+                    lastPowerLongPressElapsed > 0L
+                            && now - lastPowerLongPressElapsed >= 0L
+                            && now - lastPowerLongPressElapsed
+                            <= POWER_MARKER_WINDOW_MS;
+
+            boolean fromVoiceWake =
+                    lastVoiceWakeElapsed > 0L
+                            && now - lastVoiceWakeElapsed >= 0L
+                            && now - lastVoiceWakeElapsed
+                            <= VOICE_WAKE_MARKER_WINDOW_MS;
+
+            if (fromVoiceWake) {
+                lastVoiceWakeElapsed = 0L;
+            }
+
+            final String source = fromVoiceWake
+                    ? "VOICE_WAKE"
+                    : (fromPower ? "POWER" : "HOME_GESTURE");
+
+            final boolean targetAssistant;
+            if (fromVoiceWake) {
+                // Voice wake remains a dedicated beta route and is intentionally
+                // excluded from the CTS/Assistant Home-vs-Power swap.
+                targetAssistant = runtimeVoiceWakeAssistant;
+            } else if (runtimeSwapCtsAssistant) {
+                // Explicit swap mode: Home/gesture -> Assistant, Power -> CTS.
+                targetAssistant = !fromPower;
+            } else {
+                targetAssistant = fromPower && runtimePowerGemini;
+            }
+
+            Log.i(TAG,
+                    "Trigger classified source=" + source
+                            + " target=" + (targetAssistant ? "ASSISTANT" : "CTS")
+                            + " swap=" + runtimeSwapCtsAssistant);
+
+            if (activationRunner != null) {
+                if (targetAssistant) {
+                    activationRunner.activateAssistantSession(
+                            runtimeDelayMs,
+                            runtimeVibrate,
+                            runtimeSound);
+                } else {
+                    activationRunner.activateCts(
+                            runtimeDelayMs,
+                            runtimeVibrate,
+                            runtimeSound);
                 }
             }
         }
@@ -565,11 +729,23 @@ public class HomeHoldService extends Service {
                 || !isAutomaticRecoveryAvailable()
                 || logSessionState
                         != WatcherIpc.STATE_NEEDS_RECONNECT
-                || autoRecoveryAttemptedForCurrentLoss) {
+                || autoRecoveryAttemptedForCurrentLoss
+                || autoRecoveryAttempts >= MAX_AUTO_RECOVERY_ATTEMPTS) {
             return;
         }
 
+        try {
+            PowerManager power = getSystemService(PowerManager.class);
+            if (power != null && !power.isInteractive()) {
+                // Do not burn the one recovery attempt behind a sleeping or
+                // locked screen. USER_PRESENT will retry when the user wakes it.
+                return;
+            }
+        } catch (Throwable ignored) {
+        }
+
         autoRecoveryAttemptedForCurrentLoss = true;
+        autoRecoveryAttempts++;
 
         try {
             Intent open =
@@ -609,44 +785,34 @@ public class HomeHoldService extends Service {
                     }
                 },
                 AUTO_RECOVERY_SURFACE_CHECK_MS);
+
+        // If OEM background-activity policy swallowed the bridge, allow a
+        // later USER_PRESENT event to make another attempt. Never loop-launch
+        // Activities on a timer.
+        mainHandler.postDelayed(
+                () -> {
+                    if (running
+                            && isEnabled()
+                            && logSessionState
+                                    == WatcherIpc.STATE_NEEDS_RECONNECT) {
+                        autoRecoveryAttemptedForCurrentLoss = false;
+                        maybeAutoRecoverLogSession(
+                                "retry-" + autoRecoveryAttempts);
+                    }
+                },
+                RECOVERY_RETRY_ARM_MS);
     }
 
-    private void destroyCurrentLogcatAndWait() {
-        Process p;
+    private void closeCurrentLogdSession() {
+        SingleDirectLogdSession session;
 
-        synchronized (logcatLock) {
-            p = logcatProcess;
-            logcatProcess = null;
+        synchronized (logSessionLock) {
+            session = directLogdSession;
+            directLogdSession = null;
         }
 
-        if (p == null) {
-            return;
-        }
-
-        try {
-            p.destroy();
-        } catch (Throwable ignored) {
-        }
-
-        try {
-            if (!p.waitFor(
-                    450L,
-                    TimeUnit.MILLISECONDS)) {
-                try {
-                    p.destroyForcibly();
-                } catch (Throwable ignored) {
-                }
-
-                try {
-                    p.waitFor(
-                            250L,
-                            TimeUnit.MILLISECONDS);
-                } catch (Throwable ignored) {
-                }
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        } catch (Throwable ignored) {
+        if (session != null) {
+            session.close();
         }
     }
 
@@ -659,6 +825,7 @@ public class HomeHoldService extends Service {
 
         if (state == WatcherIpc.STATE_ACTIVE) {
             autoRecoveryAttemptedForCurrentLoss = false;
+            autoRecoveryAttempts = 0;
         }
 
         sendStateToClient();
@@ -705,77 +872,84 @@ public class HomeHoldService extends Service {
         }
     }
 
-    private void ensureKeepAliveOverlay() {
-        if (keepAliveOverlay != null) {
+    private void registerWakeReceiver() {
+        if (wakeReceiverRegistered) {
             return;
         }
 
-        if (Build.VERSION.SDK_INT >= 23
-                && !Settings.canDrawOverlays(this)) {
-            return;
-        }
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_SCREEN_OFF);
+        filter.addAction(Intent.ACTION_SCREEN_ON);
+        filter.addAction(Intent.ACTION_USER_PRESENT);
 
         try {
-            windowManager =
-                    (WindowManager)
-                            getSystemService(
-                                    WINDOW_SERVICE);
-
-            if (windowManager == null) {
-                return;
-            }
-
-            View v = new View(this);
-            v.setAlpha(0.01f);
-
-            int type;
-
-            if (Build.VERSION.SDK_INT >= 26) {
-                type =
-                        WindowManager.LayoutParams
-                                .TYPE_APPLICATION_OVERLAY;
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(
+                        wakeReceiver,
+                        filter,
+                        Context.RECEIVER_NOT_EXPORTED);
             } else {
-                type =
-                        WindowManager.LayoutParams.TYPE_PHONE;
+                registerReceiver(wakeReceiver, filter);
             }
+            wakeReceiverRegistered = true;
+        } catch (Throwable t) {
+            Log.w(TAG, "Unable to register wake recovery receiver", t);
+        }
+    }
 
-            WindowManager.LayoutParams lp =
-                    new WindowManager.LayoutParams(
-                            1,
-                            1,
-                            type,
-                            WindowManager.LayoutParams
-                                            .FLAG_NOT_FOCUSABLE
-                                    | WindowManager.LayoutParams
-                                            .FLAG_NOT_TOUCHABLE
-                                    | WindowManager.LayoutParams
-                                            .FLAG_LAYOUT_NO_LIMITS,
-                            PixelFormat.TRANSLUCENT);
+    private void unregisterWakeReceiver() {
+        if (!wakeReceiverRegistered) {
+            return;
+        }
+        wakeReceiverRegistered = false;
+        try {
+            unregisterReceiver(wakeReceiver);
+        } catch (Throwable ignored) {
+        }
+    }
 
-            lp.gravity =
-                    Gravity.TOP | Gravity.START;
-
-            windowManager.addView(v, lp);
-            keepAliveOverlay = v;
-
-        } catch (Throwable e) {
-            Log.w(
-                    TAG,
-                    "Unable to attach keep-alive overlay",
-                    e);
+    private void ensureKeepAliveOverlay() {
+        if (overlayGuardian == null) {
+            overlayGuardian = new OverlayGuardian(this);
+            overlayGuardian.start();
+        } else {
+            overlayGuardian.ensureNow("service-nudge");
         }
     }
 
     private void removeKeepAliveOverlay() {
-        View v = keepAliveOverlay;
-        keepAliveOverlay = null;
+        OverlayGuardian guardian = overlayGuardian;
+        overlayGuardian = null;
+        if (guardian != null) {
+            guardian.stop();
+        }
+    }
 
-        if (v != null
-                && windowManager != null) {
-            try {
-                windowManager.removeView(v);
-            } catch (Throwable ignored) {
-            }
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+
+        if (running && isEnabled()) {
+            ensureKeepAliveOverlay();
+            RestartReceiver.armLease(this);
+            WatcherRescueJobService.ensureScheduled(this);
+
+            // Re-assert the foreground state after memory-pressure callbacks.
+            // This does not create a new service; it only refreshes the current
+            // watcher notification/type if ColorOS has re-evaluated it.
+            startWatcherForeground(
+                    WatcherNotificationHelper.buildWatcherNotification(
+                            this,
+                            logSessionState));
+        }
+    }
+
+    @Override
+    public void onLowMemory() {
+        super.onLowMemory();
+        if (running && isEnabled()) {
+            ensureKeepAliveOverlay();
+            RestartReceiver.armLease(this);
         }
     }
 

@@ -5,16 +5,17 @@
 package dev.evoker.homeholdcts;
 
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.os.Build;
+import android.os.PowerManager;
 import android.util.Log;
 
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.lang.reflect.Method;
-import java.util.HashSet;
-import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -50,7 +51,9 @@ final class FirstRunBootstrap {
     boolean isDone() {
         SharedPreferences prefs = context.getSharedPreferences(
                 MainActivity.PREFS, Context.MODE_PRIVATE);
-        return prefs.getBoolean(PREF_BOOTSTRAP_DONE, false) && hasReadLogs();
+        return prefs.getBoolean(PREF_BOOTSTRAP_DONE, false)
+                && hasReadLogs()
+                && hasKeepAliveProvisioning();
     }
 
     boolean hasReadLogs() {
@@ -58,9 +61,22 @@ final class FirstRunBootstrap {
                 == PackageManager.PERMISSION_GRANTED;
     }
 
+    private boolean hasKeepAliveProvisioning() {
+        try {
+            PowerManager power = context.getSystemService(PowerManager.class);
+            return power != null
+                    && power.isIgnoringBatteryOptimizations(
+                            context.getPackageName());
+        } catch (Throwable t) {
+            Log.w(TAG, "KeepAlive Doze check failed", t);
+            return false;
+        }
+    }
+
     String getLastCommandLog() {
-        return context.getSharedPreferences(MainActivity.PREFS, Context.MODE_PRIVATE)
+        String log = context.getSharedPreferences(MainActivity.PREFS, Context.MODE_PRIVATE)
                 .getString(PREF_COMMAND_LOG, "No privileged setup has run yet.");
+        return sanitizeUiLog(log);
     }
 
     long getLastExecutionTimeMs() {
@@ -129,41 +145,46 @@ final class FirstRunBootstrap {
             int ok = 0;
             int fail = 0;
             int skip = 0;
-            Set<String> missing = new HashSet<>();
 
             try {
                 for (SetupCommands.Command c : SetupCommands.shizukuAll(self)) {
                     if (c.requiresInstalledPackage
                             && !self.equals(c.packageName)
                             && !isInstalled(c.packageName)) {
-                        if (missing.add(c.packageName)) {
-                            report.append("\n— ").append(c.label)
-                                    .append(" [").append(c.packageName).append("]\n")
-                                    .append("  SKIP: package not installed\n");
-                            skip++;
-                        }
+                        appendReportRow(
+                                report,
+                                "SKIPPED",
+                                c.label,
+                                c.action,
+                                "package not installed");
+                        skip++;
                         continue;
                     }
 
                     ShellResult r = shell(c.command);
-                    report.append(r.success() ? "\n✓ " : "\n✗ ")
-                            .append(c.command)
-                            .append("\n  exit=").append(r.exitCode);
-                    if (!r.stdout.isEmpty()) {
-                        report.append(" · out=").append(oneLine(r.stdout));
-                    }
-                    if (!r.stderr.isEmpty()) {
-                        report.append(" · err=").append(oneLine(r.stderr));
-                    }
-                    report.append('\n');
+                    String detail = "exit=" + r.exitCode;
+                    if (!r.stdout.isEmpty()) detail += " · out=" + oneLine(r.stdout);
+                    if (!r.stderr.isEmpty()) detail += " · err=" + oneLine(r.stderr);
+                    appendReportRow(
+                            report,
+                            r.success() ? "SUCCESS" : "FAILED",
+                            c.label,
+                            c.action,
+                            detail);
                     if (r.success()) ok++; else fail++;
                 }
 
-                report.insert(0, "Setup result: " + ok + " OK · "
+                report.insert(0,
+                        "COMMAND RESULTS\n"
+                                + "Status | Target | Action | Detail\n"
+                                + "------------------------------------------------\n");
+                report.insert(0, "Setup result: " + ok + " successful · "
                         + fail + " failed · " + skip + " skipped\n");
 
-                saveReport(report.toString());
-                emitLog(report.toString());
+                saveReport(sanitizeUiLog(report.toString()));
+                emitLog(sanitizeUiLog(report.toString()));
+
+                refreshWatcherForegroundTypeIfEnabled();
 
                 if (hasReadLogs()) {
                     context.getSharedPreferences(MainActivity.PREFS, Context.MODE_PRIVATE)
@@ -177,13 +198,33 @@ final class FirstRunBootstrap {
                 report.append("\nFATAL: ")
                         .append(t.getClass().getSimpleName())
                         .append(": ").append(t.getMessage());
-                saveReport(report.toString());
-                emitLog(report.toString());
+                saveReport(sanitizeUiLog(report.toString()));
+                emitLog(sanitizeUiLog(report.toString()));
                 emitState("BOOTSTRAP_FAILED");
             } finally {
                 busy = false;
             }
         });
+    }
+
+    private void refreshWatcherForegroundTypeIfEnabled() {
+        try {
+            boolean enabled = context.getSharedPreferences(
+                    MainActivity.PREFS,
+                    Context.MODE_PRIVATE)
+                    .getBoolean(MainActivity.PREF_ENABLED, false);
+            if (!enabled) return;
+
+            Intent refresh = new Intent(context, HomeHoldService.class)
+                    .setAction(HomeHoldService.ACTION_REFRESH_FGS);
+            if (Build.VERSION.SDK_INT >= 26) {
+                context.startForegroundService(refresh);
+            } else {
+                context.startService(refresh);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "KeepAlive V1 watcher FGS refresh failed", t);
+        }
     }
 
     private boolean isInstalled(String pkg) {
@@ -195,8 +236,47 @@ final class FirstRunBootstrap {
         }
     }
 
+    private static boolean isAssistantSecureSetting(String command) {
+        if (command == null) return false;
+        return command.contains(" put secure assistant ")
+                || command.contains(" put secure voice_interaction_service ");
+    }
+
+    private static String sanitizeUiLog(String value) {
+        if (value == null || value.isEmpty()) return value == null ? "" : value;
+        String[] lines = value.split("\n", -1);
+        StringBuilder out = new StringBuilder();
+        for (String line : lines) {
+            String clean = line;
+            if (isAssistantSecureSetting(line)) {
+                clean = line.startsWith("✗")
+                        ? "✗ Assistant configuration [internal]"
+                        : "✓ Assistant configuration [internal]";
+            }
+            if (out.length() > 0) out.append('\n');
+            out.append(clean);
+        }
+        return out.toString();
+    }
+
     private static String oneLine(String value) {
         return value.replace('\n', ' ').replace('\r', ' ').trim();
+    }
+
+    private static void appendReportRow(
+            StringBuilder report,
+            String status,
+            String target,
+            String action,
+            String detail) {
+        report.append(status)
+                .append(" | ")
+                .append(target)
+                .append(" | ")
+                .append(action)
+                .append(" | ")
+                .append(detail)
+                .append('\n');
     }
 
     private ShellResult shell(String command) throws Exception {

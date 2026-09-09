@@ -69,6 +69,41 @@ final class SettingsNavigator {
         }
     }
 
+    static void assistantSettings(Activity activity) {
+        // The AOSP/ColorOS digital-assistant picker. This is the same Settings
+        // surface exposed as "Assist & voice input" on many Android builds.
+        Intent direct = new Intent(Settings.ACTION_VOICE_INPUT_SETTINGS);
+        direct.setComponent(new ComponentName(
+                "com.android.settings",
+                "com.android.settings.Settings$ManageAssistActivity"));
+        direct.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            activity.startActivity(direct);
+            return;
+        } catch (Throwable ignored) {
+        }
+
+        Intent voiceInput = new Intent(Settings.ACTION_VOICE_INPUT_SETTINGS);
+        voiceInput.setPackage("com.android.settings");
+        try {
+            activity.startActivity(voiceInput);
+            return;
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            activity.startActivity(new Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS));
+            return;
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            activity.startActivity(new Intent(Settings.ACTION_SETTINGS));
+        } catch (Throwable t) {
+            Toast.makeText(activity, UiText.tr(activity, "Settings page unavailable"), Toast.LENGTH_SHORT).show();
+        }
+    }
+
     static void autoLaunch(Activity activity) {
         // ColorOS 16 does not expose a stable exported Auto launch page to
         // third-party apps. Open Settings only; the bundled guide shows the path.
@@ -79,6 +114,13 @@ final class SettingsNavigator {
         } catch (Throwable t) {
             activity.startActivity(new Intent(Settings.ACTION_SETTINGS));
         }
+    }
+
+    static void developerOptions(Activity activity) {
+        Intent developerOptions =
+                new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS);
+        developerOptions.setPackage("com.android.settings");
+        start(activity, developerOptions, new Intent(Settings.ACTION_SETTINGS));
     }
 
 

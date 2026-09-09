@@ -29,9 +29,10 @@ import android.view.WindowManager;
  */
 public final class LogSessionBridgeActivity extends Activity {
 
-    private static final long REQUEST_DELAY_MS = 140L;
-    private static final long STATE_FALLBACK_MS = 850L;
-    private static final long VISIBLE_TIMEOUT_MS = 2600L;
+    private static final long REQUEST_DELAY_MS = 420L;
+    private static final long STATE_FALLBACK_MS = 1200L;
+    private static final long VISIBLE_TIMEOUT_MS = 6500L;
+    private static final long ABSOLUTE_TIMEOUT_MS = 12_000L;
 
     private final Handler ui =
             new Handler(Looper.getMainLooper());
@@ -41,6 +42,7 @@ public final class LogSessionBridgeActivity extends Activity {
     private boolean reconnectSent;
     private boolean sawConnecting;
     private boolean resumed;
+    private boolean windowFocused;
     private boolean finished;
 
     private final Messenger incomingMessenger =
@@ -106,10 +108,7 @@ public final class LogSessionBridgeActivity extends Activity {
                             WatcherIpc.MSG_REGISTER_CLIENT,
                             true);
 
-                    ui.postDelayed(
-                            LogSessionBridgeActivity.this
-                                    ::requestReconnectOnce,
-                            REQUEST_DELAY_MS);
+                    maybeScheduleReconnectFromTop();
 
                     ui.postDelayed(
                             () -> {
@@ -148,6 +147,10 @@ public final class LogSessionBridgeActivity extends Activity {
         transparent.setBackgroundColor(Color.TRANSPARENT);
         setContentView(transparent);
 
+        // Hard ceiling: never leave a transparent bridge task hanging if an
+        // OEM suppresses focus or blocks the SystemUI log-access dialog.
+        ui.postDelayed(this::finishQuietly, ABSOLUTE_TIMEOUT_MS);
+
         try {
             overridePendingTransition(0, 0);
         } catch (Throwable ignored) {
@@ -171,31 +174,50 @@ public final class LogSessionBridgeActivity extends Activity {
         super.onResume();
         resumed = true;
 
-        if (watcherBound && !reconnectSent) {
-            ui.postDelayed(
-                    this::requestReconnectOnce,
-                    REQUEST_DELAY_MS);
-        }
+        maybeScheduleReconnectFromTop();
 
-        /*
-         * If Android never surfaces the confirmation dialog (for example an
-         * OEM blocks the background Activity start path), do not leave a
-         * transparent Activity sitting over the current app.
-         *
-         * When the Android log dialog actually appears this Activity is paused,
-         * so the timeout is cancelled in onPause().
-         */
-        ui.removeCallbacks(visibleTimeout);
-        ui.postDelayed(
-                visibleTimeout,
-                VISIBLE_TIMEOUT_MS);
+        // Start the visible timeout only after this bridge really owns window
+        // focus. onResume() alone does not guarantee PROCESS_STATE_TOP on
+        // ColorOS, and requesting logd too early is silently auto-declined by
+        // Android's LogcatManagerService.
+        if (windowFocused) {
+            ui.removeCallbacks(visibleTimeout);
+            ui.postDelayed(visibleTimeout, VISIBLE_TIMEOUT_MS);
+        }
     }
 
     @Override
     protected void onPause() {
         resumed = false;
+        windowFocused = false;
         ui.removeCallbacks(visibleTimeout);
         super.onPause();
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        windowFocused = hasFocus;
+
+        if (hasFocus && resumed) {
+            ui.removeCallbacks(visibleTimeout);
+            ui.postDelayed(visibleTimeout, VISIBLE_TIMEOUT_MS);
+            maybeScheduleReconnectFromTop();
+        }
+    }
+
+    private void maybeScheduleReconnectFromTop() {
+        if (finished
+                || reconnectSent
+                || !watcherBound
+                || !resumed
+                || !windowFocused) {
+            return;
+        }
+
+        ui.postDelayed(
+                this::requestReconnectOnce,
+                REQUEST_DELAY_MS);
     }
 
     @Override
@@ -225,7 +247,8 @@ public final class LogSessionBridgeActivity extends Activity {
         if (finished
                 || reconnectSent
                 || !watcherBound
-                || !resumed) {
+                || !resumed
+                || !windowFocused) {
             return;
         }
 
