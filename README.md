@@ -1,12 +1,33 @@
 # MindTrigger Assist v16.2
 
+[English](#english) · [Tiếng Việt](#tiếng-việt)
+
+## English
+
+MindTrigger Assist maps the configured ColorOS long-press gesture to Circle to
+Search and can route a Power long press to Android Assistant. It primarily
+targets OPPO Find X7 / ColorOS 16 China.
+
+### Quick setup
+
+1. Start **Shizuku** with Wireless debugging or a computer.
+2. Open MindTrigger Assist and choose **Run setup with Shizuku**.
+3. Allow the Shizuku request and wait for the result table to report success.
+4. Complete the manual ColorOS steps shown by the app: enable the Breeno
+   long-press gesture, lock MindTrigger in Recent tasks, and enable Auto launch
+   for Google/Gemini.
+5. Select **Run MindTrigger Assist**, then allow Android device-log access.
+6. Test Home/gesture for Circle to Search and Power for Assistant.
+
+Shizuku is required only during setup. If it is unavailable, choose **Copy ADB
+one-shot** and run the generated command once from a computer. If triggers stop
+later, reopen the app and allow Android's device-log prompt; `READ_LOGS` alone
+does not prove that the live log session is still connected.
+
+## Tiếng Việt
+
 Biến thao tác nhấn giữ của ColorOS thành Circle to Search hoặc gọi Trợ lý
 Android. Bản này dành chủ yếu cho OPPO Find X7 / ColorOS 16 China.
-
-## 🎬 Setup nhanh nhất — xem video bên dưới
-
-Video hướng dẫn chính thức sẽ được gắn tại đây. Hiện chưa có link/video nguồn
-để nhúng; trong lúc chờ, cứ làm đúng sáu bước ngắn bên dưới.
 
 ## Cần chuẩn bị
 

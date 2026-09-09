@@ -78,8 +78,8 @@ or provide these environment variables:
   MTA_KEY_PASSWORD
 
 The configured APK signing schemes are:
-  v1 = enabled
-  v2 = enabled
+  v1 = disabled
+  v2 = disabled
   v3 = enabled
   v4 = disabled
 """.stripIndent())
